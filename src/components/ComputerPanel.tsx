@@ -1,9 +1,8 @@
-// The bot's computer, in the right-side slot. Where it runs decides the
-// whole flow: cloud → provision the box on open (idempotent) and preview
-// via SSE frames or a ~4s screenshot poll; local ("This Mac") → frames
-// come from the Electron main process (desktopCapturer over the preload
-// bridge — box endpoints are never touched); off → parked. Auto (unset)
-// prefers the cloud box when one exists, else local inside the app.
+// The bot's computer, in the right-side slot. Explicit Cloud uses either the
+// self-hosted per-bot Docker environment (server deployment) or paid Box
+// fallback; Docker is terminal-only, while Box has screenshot/desktop URLs.
+// Local/unset uses the VPS in the browser build or This Mac in Electron. Off
+// selects neither runtime (an existing isolated environment is parked).
 import { useEffect, useRef, useState } from "react";
 import {
   CalendarClock,
@@ -31,6 +30,7 @@ type Phase =
   | "unconfigured"
   | "starting"
   | "ready"
+  | "docker"
   | "local"
   | "local-unavailable"
   | "off"
@@ -40,6 +40,8 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
   const { state, dispatch } = useStore();
   const [phase, setPhase] = useState<Phase>("checking");
   const [boxState, setBoxState] = useState<string | null>(null);
+  const [computerKind, setComputerKind] = useState<"box" | "docker">("box");
+  const [limits, setLimits] = useState<{ cpus?: string; memory?: string; storage?: string } | null>(null);
   const [polledFrame, setPolledFrame] = useState<{ png: string; mime: string } | null>(null);
   const [localFrame, setLocalFrame] = useState<string | null>(null);
   const [pending, setPending] = useState<"join" | "sleep" | null>(null);
@@ -54,27 +56,34 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
     setPhase("checking");
     setPolledFrame(null);
     setLocalFrame(null);
+    setComputerKind("box");
+    setLimits(null);
     setError(null);
     const isElectron = Boolean(window.ogb);
     if (bot.computer === "off") {
       setPhase("off");
       return;
     }
-    if (bot.computer === "local") {
+    if (bot.computer !== "cloud") {
+      // Browser/server build: unset or Local means the VPS itself. Electron
+      // keeps its existing "This Mac" path.
       setPhase(isElectron ? "local" : "local-unavailable");
       return;
     }
-    // cloud, or auto (cloud box wins when one exists, else local in-app)
+    // Explicit Cloud only. Merely opening the panel must not allocate compute.
     api(`/api/bots/${bot.id}/computer`)
       .then((status) => {
         if (!alive) return;
-        const autoLocal = bot.computer !== "cloud" && isElectron;
-        if (!status.configured) {
-          setPhase(autoLocal ? "local" : "unconfigured");
+        if (status.kind === "docker") {
+          setComputerKind("docker");
+          setLimits(status.limits ?? null);
+          setBoxState(status.box?.state ?? "stopped");
+          setPhase("docker");
           return;
         }
-        if (!status.box && autoLocal) {
-          setPhase("local");
+        setComputerKind("box");
+        if (!status.configured) {
+          setPhase("unconfigured");
           return;
         }
         setPhase("starting");
@@ -99,7 +108,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
   const sseFlowing = Boolean(bot.busy && live);
   const inFlight = useRef(false);
   useEffect(() => {
-    if (phase !== "ready" || sseFlowing) return;
+    if (phase !== "ready" || computerKind !== "box" || sseFlowing) return;
     let alive = true;
     const shoot = async () => {
       if (inFlight.current) return;
@@ -119,7 +128,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
       alive = false;
       clearInterval(timer);
     };
-  }, [phase, sseFlowing, bot.id]);
+  }, [phase, computerKind, sseFlowing, bot.id]);
 
   // local preview: frames from the Electron main process. The FIRST capture
   // attempt is what makes macOS show the Screen Recording prompt (there is
@@ -166,17 +175,17 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
       .then((result) => {
         // the join URL's stream token rotates — always freshly minted, never cached
         if (kind === "join" && result.joinUrl) window.open(result.joinUrl);
-        if (kind === "sleep") setBoxState("archived");
+        if (kind === "sleep") setBoxState(computerKind === "docker" ? "stopped" : "archived");
       })
       .catch((e) => setError(e.message))
       .finally(() => setPending(null));
   };
 
-  const emptyState: Record<Exclude<Phase, "ready" | "local">, string> = {
+  const emptyState: Record<Exclude<Phase, "ready" | "docker" | "local">, string> = {
     checking: "Checking…",
     starting: "Starting your bot's computer…",
     unconfigured: "No cloud computer configured",
-    "local-unavailable": "Local preview needs the desktop app — run pnpm dev:desktop",
+    "local-unavailable": "This bot uses the VPS directly. Choose Cloud for an isolated per-bot container.",
     off: "This bot's computer is off",
     error: "Couldn't reach the computer",
   };
@@ -204,8 +213,9 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
       <div className="flex-1 overflow-y-auto px-5 pb-5">
         {/* Screen preview */}
         <div className="mb-1.5 mt-2 flex items-center justify-between text-[13px] text-ink-secondary">
-          <span>{bot.name}'s screen</span>
+          <span>{computerKind === "docker" ? `${bot.name}'s environment` : `${bot.name}'s screen`}</span>
           {phase === "local" && <span className="text-[11px]">this Mac</span>}
+          {phase === "docker" && <span className="text-[11px]">terminal only</span>}
         </div>
         <div className="flex aspect-[16/10] w-full items-center justify-center overflow-hidden rounded-xl bg-card">
           {frameSrc ? (
@@ -220,13 +230,15 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
                 <Monitor size={22} />
               )}
               <span className="text-[12px]">
-                {phase === "ready"
-                  ? "Waiting for the first frame…"
-                  : phase === "local"
-                    ? localMisses >= 3
-                      ? "No frames yet — the preview needs Screen Recording permission. After granting, relaunch the app (macOS applies it on next launch)."
-                      : "Capturing this Mac's screen…"
-                    : emptyState[phase]}
+                {phase === "docker"
+                  ? `Isolated Linux container · ${boxState === "running" ? "running" : "stopped"}. It wakes automatically on the next Codex turn.`
+                  : phase === "ready"
+                    ? "Waiting for the first frame…"
+                    : phase === "local"
+                      ? localMisses >= 3
+                        ? "No frames yet — the preview needs Screen Recording permission. After granting, relaunch the app (macOS applies it on next launch)."
+                        : "Capturing this Mac's screen…"
+                      : emptyState[phase]}
               </span>
               {phase === "local" && localMisses >= 3 && (
                 <button
@@ -245,7 +257,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
             {error}
           </div>
         )}
-        {phase === "unconfigured" && (
+        {phase === "unconfigured" && computerKind === "box" && (
           <div className="mt-3 rounded-xl bg-card p-4">
             <div className="mb-3 text-[13px] text-ink-secondary">
               Paste a Box token from box.ascii.dev to give this bot a cloud computer — it spins up right here.
@@ -259,8 +271,8 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
           </div>
         )}
 
-        {/* Cloud-only actions */}
-        {phase === "ready" && (
+        {/* Paid Box-only actions */}
+        {phase === "ready" && computerKind === "box" && (
           <div className="mt-3 flex gap-2">
             <button
               onClick={() => run("join")}
@@ -284,18 +296,40 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
           </div>
         )}
 
+        {phase === "docker" && (
+          <div className="mt-3 rounded-xl bg-card p-4 text-[13px] text-ink-secondary">
+            <div className="font-medium text-ink">Terminal-only isolated environment</div>
+            <div className="mt-1">
+              Codex, shell commands and files run inside this bot's container. Files persist while the bot exists; deleting
+              the bot deletes the environment.
+            </div>
+            <div className="mt-2 text-[12px]">
+              Limits: {limits?.cpus ?? "1"} vCPU · {limits?.memory ?? "2g"} RAM · {limits?.storage ?? "10G"} disk
+            </div>
+            {boxState === "running" && (
+              <button
+                onClick={() => run("sleep")}
+                disabled={pending === "sleep"}
+                className="mt-3 flex items-center gap-2 rounded-lg bg-raised px-3 py-2 text-[13px] text-ink hover:bg-raised-hover disabled:opacity-50"
+              >
+                {pending === "sleep" ? <Loader2 size={14} className="animate-spin" /> : <Moon size={14} />}
+                Stop now
+              </button>
+            )}
+          </div>
+        )}
+
         {/* Computer source */}
         <div className="mt-4 rounded-xl bg-card p-4">
           <div className="text-[15px] font-medium text-ink">Runs on</div>
           <div className="mt-0.5 text-[13px] text-ink-secondary">
-            {bot.computer ? "" : "Auto: the cloud box when one exists, else this Mac. "}Pick where this bot's
-            computer lives.
+            Default/Local uses the VPS. Cloud creates a persistent isolated container for this bot.
           </div>
           <div className="mt-3 flex overflow-hidden rounded-lg border border-hairline/40">
             {(
               [
-                ["cloud", "Cloud box"],
-                ["local", "This Mac"],
+                ["cloud", "Isolated"],
+                ["local", "VPS"],
                 ["off", "Off"],
               ] as const
             ).map(([mode, label], i) => (

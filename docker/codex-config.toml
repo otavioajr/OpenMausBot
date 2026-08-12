@@ -1,0 +1,29 @@
+# Config publica do Codex dentro de cada ambiente isolado.
+# O bot fala apenas com a sidecar `router` na sua rede privada. A sidecar
+# injeta o segredo real; o container do bot nunca recebe nem armazena a chave.
+model_provider = "9router"
+model_reasoning_effort = "high"
+service_tier = "fast"
+
+[projects."/workspace"]
+trust_level = "trusted"
+
+# O processo Codex precisa da chave para falar com o provider, mas comandos
+# shell disparados pelo modelo NAO devem herda-la. A allowlist e' mais segura
+# que tentar prever todos os nomes possiveis de segredo.
+[shell_environment_policy]
+inherit = "none"
+include_only = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TERM", "TMPDIR", "PWD"]
+experimental_use_profile = false
+
+[model_providers.9router]
+name = "9Router (private proxy)"
+base_url = "http://router:8080/v1"
+wire_api = "responses"
+env_key = "BOT_ROUTER_KEY"
+
+# Evita o warning que existe na configuracao do host: todo role precisa de
+# description nas versoes recentes do Codex.
+[agents.subagent]
+description = "Focused worker for delegated subtasks inside this bot's isolated workspace"
+model = "cx/gpt-5.6-sol"

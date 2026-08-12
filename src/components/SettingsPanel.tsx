@@ -178,7 +178,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
           <div className="rounded-xl bg-card p-4">
             <div className="text-[15px] font-medium text-ink">Computer</div>
             <div className="mt-0.5 text-[13px] text-ink-secondary">
-              Where this bot's computer runs{bot.computer ? "" : " (currently: auto)"}
+              Default/Local uses the VPS; Cloud gives this bot an isolated container
             </div>
             <div className="mt-3 flex overflow-hidden rounded-lg border border-hairline/40">
               {(["cloud", "local", "off"] as const).map((mode, i) => (

@@ -56,7 +56,7 @@ export interface Bot {
   unread: boolean;
   busy?: boolean;
   modelSelection: ModelSelection;
-  /** Where this bot's computer runs; unset = auto (cloud box if one exists, else local). */
+  /** Where this bot runs; unset/local = host VPS, cloud = per-bot isolated container. */
   computer?: "cloud" | "local" | "off";
   pinned?: boolean;
   hidden?: boolean;

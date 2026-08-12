@@ -92,8 +92,31 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       // billing to pay-as-you-go (agentcal)
       delete env.OPENAI_API_KEY;
 
-      const child = spawn(config.cli, ["app-server"], {
-        cwd: turn.cwd ?? homedir(),
+      const dockerComputer = turn.integrations?.dockerComputer;
+      // In cloud/self-hosted mode the CLI itself runs in the bot's container —
+      // not merely an MCP shell bolted onto a host-side agent. That makes cwd,
+      // file edits, subprocesses and Codex's own session state truly per-bot.
+      // The isolated CLI gets a dummy credential only. A hardened sidecar on
+      // the bot's private network replaces it with the real 9router key; the
+      // agent container never receives that secret in env, argv or filesystem.
+      const command = dockerComputer ? "docker" : config.cli;
+      const args = dockerComputer
+        ? [
+            "exec",
+            "-i",
+            "-u",
+            "ubuntu",
+            "-w",
+            "/workspace",
+            "-e",
+            "BOT_ROUTER_KEY=openmausbot-private-proxy",
+            dockerComputer.containerName,
+            "codex",
+            "app-server",
+          ]
+        : ["app-server"];
+      const child = spawn(command, args, {
+        cwd: dockerComputer ? homedir() : turn.cwd ?? homedir(),
         env,
         stdio: ["pipe", "pipe", "pipe"],
         detached: true,
@@ -332,9 +355,13 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           }
           if (!codexThreadId) {
             const started = await request("thread/start", {
-              cwd: turn.cwd ?? homedir(),
+              cwd: dockerComputer ? "/workspace" : turn.cwd ?? homedir(),
               model: turn.model || null,
-              sandbox: config.fullAuto ? "danger-full-access" : "workspace-write",
+              // The container is already the sandbox (1 CPU / 2 GB, uid 1000,
+              // no capabilities, no host Docker socket). Nested bubblewrap is
+              // unreliable under Docker, so don't stack another filesystem
+              // sandbox inside it. Approval cards remain on-request.
+              sandbox: dockerComputer || config.fullAuto ? "danger-full-access" : "workspace-write",
               approvalPolicy: config.fullAuto ? "never" : "on-request",
               ephemeral: false,
             });

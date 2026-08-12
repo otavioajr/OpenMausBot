@@ -10,16 +10,18 @@ import { fileURLToPath } from "node:url";
 
 import * as box from "./box.ts";
 import * as composio from "./composio.ts";
+import * as dockerbox from "./dockerbox.ts";
 import { ensureDirs, instanceConfigs, loadConfig, saveConfig, EVENTS_DIR, NATIVE_DIR } from "./config.ts";
 import type { RuntimeEvent } from "./contracts.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
 import { EventBus } from "./harness/bus.ts";
 import { ProviderRegistry } from "./harness/registry.ts";
-import { mentionedBots, Store, type Message } from "./store.ts";
+import { mentionedBots, Store, type BotRecord, type Message } from "./store.ts";
 
 const PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
 const STATIC_DIR = process.env.OMB_STATIC_DIR || null;
+const DOCKER_COMPUTERS = /^(1|true|yes|on)$/i.test(process.env.OMB_DOCKER_COMPUTERS ?? "");
 const MIME: Record<string, string> = {
   ".html": "text/html",
   ".js": "text/javascript",
@@ -112,6 +114,47 @@ let bootSelection = { instanceId: "claude", model: "claude-sonnet-5" };
 const store = new Store(() => bootSelection);
 bootSelection = await defaultSelection();
 store.seedIfEmpty();
+function runtimeInstanceFor(bot: BotRecord) {
+  return DOCKER_COMPUTERS && bot.computer === "cloud"
+    ? registry.get("codex")
+    : registry.get(bot.modelSelection.instanceId);
+}
+
+function sessionKeyFor(bot: BotRecord): string {
+  return DOCKER_COMPUTERS && bot.computer === "cloud"
+    ? `docker:${bot.modelSelection.instanceId}:${bot.modelSelection.model}`
+    : bot.modelSelection.instanceId;
+}
+
+/** Translate the regular provider catalog into the ids exposed by 9router.
+ * The UI keeps showing the user's selected provider/model; only the isolated
+ * Codex runtime sees the routed id. */
+function isolatedModelFor(bot: BotRecord): string {
+  const model = bot.modelSelection.model;
+  if (model.includes("/") || ["combo", "Dev", "Dev-judge", "Juiz"].includes(model)) return model;
+  const selected = registry.get(bot.modelSelection.instanceId);
+  switch (selected?.driverKind) {
+    case "codex":
+      return `cx/${model}`;
+    case "claudeAgent":
+      return `cc/${model === "claude-haiku-4-5" ? "claude-haiku-4-5-20251001" : model}`;
+    case "grokAgent":
+      return `gcli/${model}`;
+    default:
+      throw new Error(`model ${model} is not available through 9router in an isolated environment`);
+  }
+}
+
+if (DOCKER_COMPUTERS) {
+  // Crash recovery is completed before accepting traffic: deleted bots must
+  // not leave environments behind, and valid containers are parked because
+  // any in-flight turn from the previous process can no longer be resumed.
+  const validIds = new Set(store.bots.map((b) => b.id));
+  const removed = await dockerbox.reapOrphans(validIds);
+  const managed = await dockerbox.listManagedBotIds();
+  await Promise.all(managed.filter((id) => validIds.has(id)).map((id) => dockerbox.sleepContainer(id)));
+  if (removed.length) console.log(`reaped ${removed.length} orphaned bot container(s)`);
+}
 
 // ── SSE fan-out to clients ─────────────────────────────────────────────
 const sseClients = new Set<ServerResponse>();
@@ -145,8 +188,8 @@ bus.subscribe((event: RuntimeEvent) => {
 
   switch (event.type) {
     case "session.started":
-      if (event.sessionId && event.providerInstanceId) {
-        store.setResumeCursor(bot.id, event.providerInstanceId, event.sessionId);
+      if (event.sessionId) {
+        store.setResumeCursor(bot.id, sessionKeyFor(bot), event.sessionId);
       }
       break;
     case "item.completed":
@@ -208,8 +251,28 @@ bus.subscribe((event: RuntimeEvent) => {
       // the screenshot-in-chat moment
       const frame = stopScreenPoller(bot.id);
       if (frame) pushMessage({ role: "bot", kind: "screen", png: frame.png, mime: frame.mime });
-      store.patchBot(bot.id, { busy: false, unread: true });
-      broadcast({ kind: "bot", bot: store.bot(bot.id) });
+      if (DOCKER_COMPUTERS && bot.computer === "cloud") {
+        // Keep the composer locked until agent + proxy are actually parked;
+        // otherwise the UI can say "finished" while Docker still reports
+        // running for a few milliseconds (and a fast next turn races stop).
+        void dockerbox
+          .sleepContainer(bot.id)
+          .catch((error) => {
+            pushMessage({
+              role: "bot",
+              kind: "activity",
+              tool: { name: `environment stop warning: ${(error as Error).message.slice(0, 120)}`, ok: false },
+            });
+          })
+          .finally(() => {
+            store.patchBot(bot.id, { busy: false, unread: true });
+            broadcast({ kind: "bot", bot: store.bot(bot.id) });
+            broadcast({ kind: "computer", botId: bot.id, state: "stopped" });
+          });
+      } else {
+        store.patchBot(bot.id, { busy: false, unread: true });
+        broadcast({ kind: "bot", bot: store.bot(bot.id) });
+      }
       break;
     }
   }
@@ -288,13 +351,18 @@ async function startTurn(botId: string, text: string, opts?: { commsDepth?: numb
   if (bot.busy) throw Object.assign(new Error("the bot is already working — interrupt it first"), { status: 409 });
   const commsDepth = opts?.commsDepth ?? 0;
 
-  const instance = registry.get(bot.modelSelection.instanceId);
-  if (!instance) {
+  const selectedInstance = registry.get(bot.modelSelection.instanceId);
+  if (!selectedInstance) {
     throw Object.assign(
       new Error(`provider instance "${bot.modelSelection.instanceId}" is unavailable — pick another model in settings`),
       { status: 409 },
     );
   }
+  // In Isolated mode, Codex is the tool-capable runtime inside the container,
+  // while the model still comes from the user's selected 9router/Claude/GPT
+  // entry. This preserves the model picker UX and adds shell/files/approvals.
+  const instance = runtimeInstanceFor(bot);
+  if (!instance) throw Object.assign(new Error("Codex runtime is unavailable for the isolated environment"), { status: 409 });
 
   const userMessage = store.appendMessage(bot.threadId, { role: "user", kind: "text", text });
   broadcast({ kind: "message", threadId: bot.threadId, message: userMessage });
@@ -325,9 +393,17 @@ async function startTurn(botId: string, text: string, opts?: { commsDepth?: numb
       const integrations: NonNullable<Parameters<typeof instance.adapter.sendTurn>[0]["integrations"]> = {};
       if (cfg.composio?.key) integrations.composio = { key: cfg.composio.key, url: cfg.composio.url };
       const wants = bot.computer; // 'cloud' | 'local' | 'off' | undefined(auto)
-      if (wants !== "off" && wants !== "local" && box.boxConfigured(cfg)) {
+      if (wants === "cloud" && DOCKER_COMPUTERS) {
+        if (instance.driverKind !== "codex") {
+          throw new Error('Self-hosted cloud environments currently require the "Codex" provider — switch this bot\'s model to Codex or choose Local');
+        }
+        broadcast({ kind: "computer", botId: bot.id, state: "provisioning" });
+        const container = await dockerbox.provisionContainer(bot.id, bot.name);
+        integrations.dockerComputer = { containerName: container.name };
+        broadcast({ kind: "computer", botId: bot.id, state: "running" });
+      } else if (wants !== "off" && wants !== "local" && !DOCKER_COMPUTERS && box.boxConfigured(cfg)) {
         let b = await box.findBox(cfg, bot.id).catch(() => null);
-        // the Computer driver runs ON the box — provision it on first use
+        // the Computer driver runs ON the paid box — provision it on first use
         if (!b && instance.driverKind === "boxAgent") {
           broadcast({ kind: "computer", botId: bot.id, state: "provisioning" });
           await box.provisionBox(cfg, bot.id, bot.name);
@@ -369,16 +445,18 @@ async function startTurn(botId: string, text: string, opts?: { commsDepth?: numb
       await instance.adapter.sendTurn({
         threadId: bot.threadId,
         text,
-        model: bot.modelSelection.model,
-        resumeCursor: bot.resumeCursors[bot.modelSelection.instanceId],
+        model: DOCKER_COMPUTERS && bot.computer === "cloud" ? isolatedModelFor(bot) : bot.modelSelection.model,
+        resumeCursor: bot.resumeCursors[sessionKeyFor(bot)],
         transcript,
         system:
           persona +
-          (integrations.computer && instance.driverKind !== "boxAgent"
-            ? " You have your own cloud computer — use the computer tools (screenshot, computer_exec, open_url) whenever browsing or acting on a desktop helps."
-            : integrations.localComputer
-              ? " You can act on the user's computer through the computer tools — take a screenshot or read the desktop state first, prefer accessibility actions over raw coordinates, and act carefully."
-              : "") +
+          (integrations.dockerComputer
+            ? " You are running inside your own isolated Linux container. /workspace and your Codex sessions persist between turns; the environment is deleted when this bot is deleted. Use shell and file tools normally — they already operate inside your container."
+            : integrations.computer && instance.driverKind !== "boxAgent"
+              ? " You have your own cloud computer — use the computer tools (screenshot, computer_exec, open_url) whenever browsing or acting on a desktop helps."
+              : integrations.localComputer
+                ? " You can act on the user's computer through the computer tools — take a screenshot or read the desktop state first, prefer accessibility actions over raw coordinates, and act carefully."
+                : "") +
           (integrations.agents
             ? " You can work with the user's other bots through the agents tools — list_bots shows who's available, ask_bot sends one of them a message and returns their reply."
             : "") +
@@ -400,6 +478,10 @@ async function startTurn(botId: string, text: string, opts?: { commsDepth?: numb
       broadcast({ kind: "message", threadId: bot.threadId, message: failure });
       store.patchBot(bot.id, { busy: false });
       broadcast({ kind: "bot", bot: store.bot(bot.id) });
+      if (DOCKER_COMPUTERS && bot.computer === "cloud") {
+        await dockerbox.sleepContainer(bot.id).catch(() => {});
+        broadcast({ kind: "computer", botId: bot.id, state: "stopped" });
+      }
     }
   })();
 }
@@ -533,13 +615,32 @@ const server = createServer(async (req, res) => {
     }
     let m = path.match(/^\/api\/bots\/([\w-]+)$/);
     if (m && method === "PATCH") {
+      const existing = store.bot(m[1]);
+      if (!existing) return json(res, 404, { error: "no such bot" });
       const body = await readBody(req);
       const patch: Record<string, unknown> = {};
       for (const key of ["name", "title", "description", "notifications", "modelSelection", "unread", "computer", "color", "mascotExpression", "pinned", "hidden"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
       }
-      const bot = store.patchBot(m[1], patch);
-      if (!bot) return json(res, 404, { error: "no such bot" });
+
+      if (DOCKER_COMPUTERS && body.computer !== undefined && body.computer !== existing.computer) {
+        if (existing.busy) return json(res, 409, { error: "interrupt the running turn before changing computer mode" });
+        if (body.computer === "cloud") {
+          broadcast({ kind: "computer", botId: existing.id, state: "provisioning" });
+          await dockerbox.provisionContainer(existing.id, existing.name);
+          // Selecting Cloud prepares the persistent filesystem, then parks it;
+          // the first turn wakes it in about a second.
+          await dockerbox.sleepContainer(existing.id);
+          broadcast({ kind: "computer", botId: existing.id, state: "stopped" });
+        } else {
+          // Local/Off preserve the environment for a future return to Cloud,
+          // but consume zero CPU/RAM while deselected.
+          await dockerbox.sleepContainer(existing.id);
+          broadcast({ kind: "computer", botId: existing.id, state: "stopped" });
+        }
+      }
+
+      const bot = store.patchBot(m[1], patch)!;
       broadcast({ kind: "bot", bot });
       return json(res, 200, { bot });
     }
@@ -547,9 +648,12 @@ const server = createServer(async (req, res) => {
     if (m && method === "DELETE") {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
-      // a running turn dies with its bot
-      await registry.get(bot.modelSelection.instanceId)?.adapter.interruptTurn(bot.threadId).catch(() => {});
+      // A running turn dies with its bot. Destroy the environment BEFORE
+      // deleting store state: if cleanup fails, preserve the bot so the user
+      // can retry instead of losing the only reference to orphaned data.
+      await runtimeInstanceFor(bot)?.adapter.interruptTurn(bot.threadId).catch(() => {});
       stopScreenPoller(bot.id);
+      if (DOCKER_COMPUTERS) await dockerbox.destroyContainer(bot.id);
       store.deleteBot(bot.id);
       for (const dir of [EVENTS_DIR, NATIVE_DIR]) {
         try {
@@ -591,7 +695,7 @@ const server = createServer(async (req, res) => {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
       const body = await readBody(req);
-      const instance = registry.get(bot.modelSelection.instanceId);
+      const instance = runtimeInstanceFor(bot);
       if (!instance) return json(res, 409, { error: "provider unavailable" });
       await instance.adapter.respondToRequest(bot.threadId, String(body.requestId), {
         behavior: body.behavior,
@@ -603,7 +707,7 @@ const server = createServer(async (req, res) => {
     if (m && method === "POST") {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
-      const instance = registry.get(bot.modelSelection.instanceId);
+      const instance = runtimeInstanceFor(bot);
       await instance?.adapter.interruptTurn(bot.threadId);
       return json(res, 200, { ok: true });
     }
@@ -657,14 +761,40 @@ const server = createServer(async (req, res) => {
     m = path.match(/^\/api\/connectors\/([\w-]+)$/);
     if (m && method === "DELETE") return json(res, 200, await composio.removeService(cfg, m[1]));
 
-    // ── the bot's cloud computer (Box) ──
+    // ── the bot's computer (self-hosted Docker, or paid Box fallback) ──
     m = path.match(/^\/api\/bots\/([\w-]+)\/computer$/);
-    if (m && method === "GET") return json(res, 200, await box.boxStatus(cfg, m[1]));
+    if (m && method === "GET") {
+      return json(res, 200, DOCKER_COMPUTERS ? await dockerbox.containerStatus(m[1]) : await box.boxStatus(cfg, m[1]));
+    }
     m = path.match(/^\/api\/bots\/([\w-]+)\/computer\/(provision|join|sleep|exec|screenshot)$/);
     if (m && method === "POST") {
       const botId = m[1];
       const bot = store.bot(botId);
       if (!bot) return json(res, 404, { error: "no such bot" });
+      if (DOCKER_COMPUTERS) {
+        switch (m[2]) {
+          case "provision": {
+            const env = await dockerbox.provisionContainer(botId, bot.name);
+            return json(res, 200, {
+              boxId: env.name,
+              machineName: env.name,
+              state: env.state,
+              desktopAvailable: false,
+              kind: "docker",
+            });
+          }
+          case "join":
+            return json(res, 409, { error: "This self-hosted environment is terminal-only — desktop UI can be added later" });
+          case "sleep":
+            return json(res, 200, await dockerbox.sleepContainer(botId));
+          case "exec": {
+            const body = await readBody(req);
+            return json(res, 200, await dockerbox.execInContainer(botId, String(body.command ?? ""), { botName: bot.name }));
+          }
+          case "screenshot":
+            return json(res, 409, { error: "This self-hosted environment has no graphical desktop" });
+        }
+      }
       switch (m[2]) {
         case "provision":
           return json(res, 200, await box.provisionBox(cfg, botId, bot.name));
