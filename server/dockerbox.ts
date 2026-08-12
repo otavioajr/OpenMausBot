@@ -18,9 +18,30 @@
 //   - runs as uid 1000 (`ubuntu`), never root
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { DATA_DIR } from "./config.ts";
+
+/** Host-side socket directory and the in-container paths of the routines
+ * bridge. Kept here (not imported from routine-bridge.ts) so the Docker layer
+ * has no dependency on the scheduler. */
+export const ROUTINE_SOCKET_DIR = join(DATA_DIR, "routine-sockets");
+export const CONTAINER_ROUTINE_SOCKET = "/run/omb/routines.sock";
+export const CONTAINER_ROUTINE_CLIENT = "/opt/omb/routines-mcp.cjs";
+/** Ships alongside the server; resolved for both dev and packaged layouts. */
+const ROUTINE_MCP_CLIENT = (() => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  for (const candidate of [
+    join(here, "..", "docker", "desktop", "routines-mcp.cjs"),
+    join(here, "..", "..", "docker", "desktop", "routines-mcp.cjs"),
+  ]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return "";
+})();
 
 const execFileAsync = promisify(execFile);
 
@@ -57,6 +78,28 @@ const LIMITS = {
   pids: process.env.OMB_DOCKER_PIDS || "512",
   storage: process.env.OMB_DOCKER_STORAGE || "10G",
 };
+
+/** Mounts that let an isolated agent manage its own routines.
+ *
+ * The container is on a `--network internal` bridge with no route to the host,
+ * and that must stay true. So the harness exposes a per-bot Unix socket and
+ * bind-mounts it in, together with a read-only MCP client that talks to it.
+ * A container can only ever reach its own socket, so it cannot see or touch
+ * another bot's schedules. Returns [] when the client script is missing (a
+ * source checkout without it still runs, just without chat-created routines).
+ */
+function routineMountArgs(botId: string): string[] {
+  if (!existsSync(ROUTINE_MCP_CLIENT)) return [];
+  mkdirSync(ROUTINE_SOCKET_DIR, { recursive: true });
+  const socket = join(ROUTINE_SOCKET_DIR, `${botId}.sock`);
+  // Docker creates a DIRECTORY at a missing bind source, which would silently
+  // shadow the real socket. Only mount once the harness has bound it.
+  if (!existsSync(socket)) return [];
+  return [
+    "-v", `${socket}:${CONTAINER_ROUTINE_SOCKET}`,
+    "-v", `${ROUTINE_MCP_CLIENT}:${CONTAINER_ROUTINE_CLIENT}:ro`,
+  ];
+}
 
 export type BoxState = "running" | "paused" | "stopped" | "missing";
 
@@ -308,6 +351,10 @@ export async function provisionContainer(
     "--cap-drop", "ALL",
     "--security-opt", "no-new-privileges",
     "--network", networks.internal,
+    // Routines bridge: a per-bot Unix socket, bind-mounted read-write, plus the
+    // read-only MCP client that speaks to it. This is deliberately NOT a
+    // network route — the container stays `internal` with no path to the host.
+    ...routineMountArgs(botId),
     // /workspace lives in this capped writable layer: it survives stop/start
     // and is deleted atomically with `docker rm`.
     "-w", "/workspace",

@@ -130,13 +130,16 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       // fine here. env is the ACP {name,value}[] shape.
       const acpMcpServers = (turn: SendTurnInput) => {
         const servers: Array<{ name: string; command: string; args: string[]; env: Array<{ name: string; value: string }> }> = [];
-        const agents = turn.integrations?.agents;
-        if (agents) {
+        for (const [name, proxy] of [
+          ["agents", turn.integrations?.agents],
+          ["routines", turn.integrations?.routines],
+        ] as const) {
+          if (!proxy) continue;
           servers.push({
-            name: "agents",
-            command: agents.command,
-            args: agents.args,
-            env: Object.entries(agents.env).map(([name, value]) => ({ name, value: String(value) })),
+            name,
+            command: proxy.command,
+            args: proxy.args,
+            env: Object.entries(proxy.env).map(([key, value]) => ({ name: key, value: String(value) })),
           });
         }
         return servers;

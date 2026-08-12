@@ -115,6 +115,9 @@ export interface SendTurnInput {
      * through the harness so this bot can message other bots. The harness
      * owns turns, permissions, and recursion limits; the proxy only forwards. */
     agents?: { command: string; args: string[]; env: Record<string, string> };
+    /** Routines: an MCP proxy (list/create/update/delete_routine) so a bot can
+     * manage its own recurring tasks from chat. Scoped to the calling bot. */
+    routines?: { command: string; args: string[]; env: Record<string, string> };
   };
   cwd?: string;
 }

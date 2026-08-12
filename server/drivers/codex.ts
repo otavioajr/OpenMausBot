@@ -12,6 +12,8 @@
 import { spawn, execFile } from "node:child_process";
 import { homedir } from "node:os";
 
+import { CONTAINER_ROUTINE_CLIENT } from "../dockerbox.ts";
+
 import type {
   DriverCreateInput,
   ProviderDriver,
@@ -121,6 +123,19 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       delete env.OPENAI_API_KEY;
 
       const dockerComputer = turn.integrations?.dockerComputer;
+      // Routines inside the container: Codex reaches the harness over a
+      // bind-mounted Unix socket (the container has no network route to the
+      // host, and this must not create one). Registered as an MCP server via
+      // -c overrides, which is the only injection point app-server offers.
+      const routineMcpArgs =
+        dockerComputer && turn.integrations?.routines
+          ? [
+              "-c",
+              `mcp_servers.routines.command="node"`,
+              "-c",
+              `mcp_servers.routines.args=["${CONTAINER_ROUTINE_CLIENT}"]`,
+            ]
+          : [];
       // In cloud/self-hosted mode the CLI itself runs in the bot's container —
       // not merely an MCP shell bolted onto a host-side agent. That makes cwd,
       // file edits, subprocesses and Codex's own session state truly per-bot.
@@ -141,6 +156,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             dockerComputer.containerName,
             "codex",
             "app-server",
+            ...routineMcpArgs,
           ]
         : ["app-server"];
       const child = spawn(command, args, {

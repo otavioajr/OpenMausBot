@@ -12,6 +12,10 @@ import * as box from "./box.ts";
 import * as composio from "./composio.ts";
 import * as desktop from "./desktop.ts";
 import * as dockerbox from "./dockerbox.ts";
+import { RoutineStore, formatInstant } from "./routines.ts";
+import { serveRoutineSocket } from "./routine-bridge.ts";
+import { describeTrigger, hostTimezone } from "./schedule.ts";
+import { RoutineScheduler } from "./scheduler.ts";
 import { ensureDirs, instanceConfigs, loadConfig, saveConfig, EVENTS_DIR, NATIVE_DIR } from "./config.ts";
 import type { RuntimeEvent } from "./contracts.ts";
 
@@ -57,6 +61,26 @@ const agentsProxyPath = (() => {
 })();
 // in the packaged app process.execPath is Electron — run the proxy as node
 const AGENTS_NODE_FLAG = { ELECTRON_RUN_AS_NODE: "1" };
+
+// The routines proxy resolves the same way (dev .ts, packaged .js).
+const routinesProxyPath = (() => {
+  const ts = join(dirname(fileURLToPath(import.meta.url)), "drivers", "routines-proxy.ts");
+  return existsSync(ts) ? ts : ts.replace(/\.ts$/, ".js");
+})();
+
+function routinesIntegration(botId: string) {
+  return {
+    command: process.execPath,
+    args: [routinesProxyPath],
+    env: {
+      ...AGENTS_NODE_FLAG,
+      OMB_HARNESS_URL: `http://127.0.0.1:${PORT}`,
+      OMB_BOT_ID: botId,
+      OMB_COMMS_TOKEN: COMMS_TOKEN,
+      OMB_TIMEZONE: hostTimezone(),
+    },
+  };
+}
 
 function agentsIntegration(botId: string, depth: number) {
   return {
@@ -115,6 +139,42 @@ let bootSelection = { instanceId: "claude", model: "claude-sonnet-5" };
 const store = new Store(() => bootSelection);
 bootSelection = await defaultSelection();
 store.seedIfEmpty();
+
+// Routines: recurring tasks. The scheduler starts an ordinary turn, so a
+// routine inherits the whole pipeline — approvals, tools, transcript, and
+// (for isolated bots) waking the container and parking it again afterwards.
+const routineStore = new RoutineStore();
+const scheduler = new RoutineScheduler({
+  routines: routineStore,
+  startTurn: (botId, text) => startTurn(botId, text),
+  isBusy: (botId) => store.bot(botId)?.busy === true,
+  botExists: (botId) => store.bot(botId) !== null,
+  notify: (botId, text) => {
+    const bot = store.bot(botId);
+    if (!bot) return;
+    const message = store.appendMessage(bot.threadId, { role: "bot", kind: "text", text });
+    broadcast({ kind: "message", threadId: bot.threadId, message });
+    store.patchBot(bot.id, { unread: true });
+    broadcast({ kind: "bot", bot: store.bot(bot.id) });
+  },
+  broadcast: (routine) => broadcast({ kind: "routine", routine }),
+});
+
+// One routines socket per isolated bot, created lazily and reused. The socket
+// must exist before `docker run` mounts it, otherwise Docker helpfully creates
+// a *directory* at that path and the mount is silently useless.
+const routineSockets = new Map<string, { path: string; close: () => void }>();
+function ensureRoutineSocket(botId: string): string {
+  const existing = routineSockets.get(botId);
+  if (existing) return existing.path;
+  const served = serveRoutineSocket(botId, {
+    routines: routineStore,
+    timezone: () => hostTimezone(),
+    onChange: (routine) => broadcast({ kind: "routine", routine }),
+  });
+  routineSockets.set(botId, served);
+  return served.path;
+}
 function runtimeInstanceFor(bot: BotRecord) {
   return DOCKER_COMPUTERS && bot.computer === "cloud"
     ? registry.get("codex")
@@ -448,6 +508,18 @@ async function startTurn(botId: string, text: string, opts?: { commsDepth?: numb
       ) {
         integrations.agents = agentsIntegration(bot.id, commsDepth);
       }
+      // Routines from chat. Same MCP-proxy shape as agents; only offered to
+      // drivers that can mount MCP servers, and never to a bot-invoked turn
+      // (a routine must not be able to schedule more routines unattended).
+      if (commsDepth === 0 && instance.adapter.capabilities.agentsMcp === true) {
+        integrations.routines = routinesIntegration(bot.id);
+      }
+      // Isolated bots reach routines over a bind-mounted socket instead (no
+      // network path out of the container). Serve it before the turn starts.
+      if (commsDepth === 0 && DOCKER_COMPUTERS && bot.computer === "cloud") {
+        ensureRoutineSocket(bot.id);
+        integrations.routines = { command: "node", args: [], env: {} };
+      }
       // @mentions in the user's message (the composer's tagging UI) become
       // an explicit delegation nudge — the agent still does the ask_bot call
       // itself, so the harness stays the single owner of turns/permissions
@@ -597,6 +669,59 @@ const server = createServer(async (req, res) => {
         const reply = await askBotAndWait(toBotId, prefixed, depth);
         return json(res, 200, { botName: target.name, text: reply });
       }
+      // routines from chat: the routines-proxy calls these. Scoped by botId
+      // so an agent can only ever see and change its own schedules.
+      if (path.startsWith("/api/internal/routines")) {
+        const label = (routine: ReturnType<typeof routineStore.get>) =>
+          routine && {
+            ...routine,
+            scheduleLabel: describeTrigger(routine.trigger, routine.timezone),
+            nextRunLabel: routine.nextRunAt ? formatInstant(routine.nextRunAt, routine.timezone) : null,
+            lastRunLabel: routine.lastRunAt ? formatInstant(routine.lastRunAt, routine.timezone) : null,
+          };
+
+        if (method === "GET" && path === "/api/internal/routines") {
+          const botId = url.searchParams.get("botId") ?? "";
+          return json(res, 200, { routines: routineStore.forBot(botId).map(label) });
+        }
+        if (method === "POST" && path === "/api/internal/routines") {
+          const body = await readBody(req);
+          const botId = String(body.botId ?? "");
+          if (!store.bot(botId)) return json(res, 404, { error: "no such bot" });
+          const routine = routineStore.create({
+            botId,
+            name: typeof body.name === "string" ? body.name : undefined,
+            instruction: String(body.instruction ?? ""),
+            trigger: body.trigger,
+            timezone: typeof body.timezone === "string" ? body.timezone : undefined,
+          });
+          broadcast({ kind: "routine", routine });
+          return json(res, 200, label(routine));
+        }
+        const internalMatch = /^\/api\/internal\/routines\/([^/]+)$/.exec(path);
+        if (internalMatch) {
+          const routine = routineStore.get(internalMatch[1]);
+          if (!routine) return json(res, 404, { error: "no such routine" });
+          if (method === "PATCH") {
+            const body = await readBody(req);
+            const updated = routineStore.update(routine.id, {
+              instruction: typeof body.instruction === "string" ? body.instruction : undefined,
+              trigger: body.trigger,
+              name: typeof body.name === "string" ? body.name : undefined,
+              timezone: typeof body.timezone === "string" ? body.timezone : undefined,
+              enabled: typeof body.enabled === "boolean" ? body.enabled : undefined,
+            });
+            if (updated) broadcast({ kind: "routine", routine: updated });
+            return json(res, 200, label(updated));
+          }
+          if (method === "DELETE") {
+            routineStore.remove(routine.id);
+            broadcast({ kind: "routine", routine: { ...routine, deleted: true } as never });
+            return json(res, 200, { ok: true });
+          }
+        }
+        return json(res, 404, { error: "unknown internal endpoint" });
+      }
       return json(res, 404, { error: "unknown internal endpoint" });
     }
 
@@ -674,6 +799,7 @@ const server = createServer(async (req, res) => {
       stopScreenPoller(bot.id);
       if (DOCKER_COMPUTERS) await dockerbox.destroyContainer(bot.id);
       store.deleteBot(bot.id);
+      routineStore.removeForBot(bot.id); // no orphan schedules firing forever
       for (const dir of [EVENTS_DIR, NATIVE_DIR]) {
         try {
           unlinkSync(join(dir, `${bot.threadId}.ndjson`));
@@ -903,6 +1029,67 @@ const server = createServer(async (req, res) => {
       }
     }
 
+    // ── routines ───────────────────────────────────────────────────────
+    // Recurring tasks. Kept generic on purpose: no assumptions about the
+    // host's timezone, no external notification channel, nothing tied to a
+    // particular deployment.
+    if (path === "/api/routines") {
+      if (method === "GET") {
+        const botId = url.searchParams.get("botId");
+        return json(res, 200, { routines: botId ? routineStore.forBot(botId) : routineStore.all() });
+      }
+      if (method === "POST") {
+        const body = await readBody(req);
+        const botId = String(body.botId ?? "");
+        if (!store.bot(botId)) return json(res, 404, { error: "no such bot" });
+        const routine = routineStore.create({
+          botId,
+          name: typeof body.name === "string" ? body.name : undefined,
+          instruction: String(body.instruction ?? ""),
+          trigger: body.trigger,
+          timezone: typeof body.timezone === "string" ? body.timezone : undefined,
+          enabled: typeof body.enabled === "boolean" ? body.enabled : undefined,
+        });
+        broadcast({ kind: "routine", routine });
+        return json(res, 201, routine);
+      }
+      return json(res, 405, { error: "GET or POST required" });
+    }
+
+    const routineMatch = /^\/api\/routines\/([^/]+)(?:\/(run))?$/.exec(path);
+    if (routineMatch) {
+      const routine = routineStore.get(routineMatch[1]);
+      if (!routine) return json(res, 404, { error: "no such routine" });
+
+      // Test run: fire now without touching the schedule.
+      if (routineMatch[2] === "run") {
+        if (method !== "POST") return json(res, 405, { error: "POST required" });
+        if (store.bot(routine.botId)?.busy) {
+          return json(res, 409, { error: "the bot is already working — interrupt it first" });
+        }
+        await scheduler.run(routine);
+        return json(res, 200, routineStore.get(routine.id));
+      }
+      if (method === "PATCH") {
+        const body = await readBody(req);
+        const updated = routineStore.update(routine.id, {
+          name: typeof body.name === "string" ? body.name : undefined,
+          instruction: typeof body.instruction === "string" ? body.instruction : undefined,
+          trigger: body.trigger,
+          timezone: typeof body.timezone === "string" ? body.timezone : undefined,
+          enabled: typeof body.enabled === "boolean" ? body.enabled : undefined,
+        });
+        if (updated) broadcast({ kind: "routine", routine: updated });
+        return json(res, 200, updated);
+      }
+      if (method === "DELETE") {
+        routineStore.remove(routine.id);
+        broadcast({ kind: "routine", routine: { ...routine, deleted: true } as never });
+        return json(res, 200, { ok: true });
+      }
+      return json(res, 405, { error: "PATCH, DELETE or POST /run required" });
+    }
+
     // packaged app: the server serves the built UI too (window → :8799 for
     // everything, no dev proxy to die). OMB_STATIC_DIR is set by Electron.
     if (method === "GET" && !path.startsWith("/api/") && STATIC_DIR) {
@@ -945,6 +1132,16 @@ if (DOCKER_COMPUTERS) desktop.attachDesktopBridge(server);
 
 server.listen(PORT, HOST, () => {
   console.log(`openmausbot server on http://${HOST}:${PORT}`);
+  // Start scheduling only once the API is accepting turns.
+  scheduler.start();
+  void scheduler.tick(); // catch anything that came due while we were down
+  // Bind each isolated bot's routines socket up front: the mount is decided at
+  // `docker run`, so a socket created later would miss the next provision.
+  if (DOCKER_COMPUTERS) {
+    for (const bot of store.bots) {
+      if (bot.computer === "cloud") ensureRoutineSocket(bot.id);
+    }
+  }
 });
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
