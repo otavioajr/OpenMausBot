@@ -260,7 +260,12 @@ bus.subscribe((event: RuntimeEvent) => {
         void desktop
           .releaseControl(bot.id)
           .catch(() => ({ control: "bot" as const }))
-          .then(() => dockerbox.sleepContainer(bot.id))
+          .then(() => {
+            // Close host-side VNC bridges first: a `docker exec socat` would
+            // otherwise freeze inside the paused container.
+            desktop.closeDesktopBridges(bot.id);
+            return dockerbox.sleepContainer(bot.id);
+          })
           .then((result) => {
             parkedState = result.state;
           })
@@ -868,6 +873,7 @@ const server = createServer(async (req, res) => {
               return json(res, 409, { error: "The bot is still working — interrupt the turn before pausing its desktop." });
             }
             await desktop.releaseControl(botId).catch(() => ({ control: "bot" as const }));
+            desktop.closeDesktopBridges(botId);
             {
               const result = await dockerbox.sleepContainer(botId);
               broadcast({ kind: "computer", botId, state: result.state });

@@ -28,6 +28,21 @@ const tickets = new Map<string, { botId: string; expires: number }>();
 const humanControl = new Map<string, { until: number }>();
 const CONTROL_TTL_MS = 5 * 60_000;
 
+/** Live VNC bridges per bot, so parking can close them from the host side.
+ * A `docker exec socat` left running would otherwise be frozen inside a paused
+ * container and hold a half-open WebSocket. */
+const bridges = new Map<string, Set<() => void>>();
+
+/** Drop tickets and tear down every live stream for one bot. Called before a
+ * graphical container is paused. */
+export function closeDesktopBridges(botId: string): void {
+  for (const [key, value] of tickets) if (value.botId === botId) tickets.delete(key);
+  const active = bridges.get(botId);
+  if (!active) return;
+  for (const stop of [...active]) stop();
+  bridges.delete(botId);
+}
+
 export function issueDesktopTicket(botId: string): { ticket: string; url: string; expiresIn: number } {
   const ticket = randomBytes(24).toString("base64url");
   tickets.set(ticket, { botId, expires: Date.now() + TICKET_TTL_MS });
@@ -157,9 +172,14 @@ function pipeToVnc(ws: WebSocket, botId: string): void {
     const shutdown = (reason: string) => {
       if (closed) return;
       closed = true;
+      bridges.get(botId)?.delete(shutdownRef);
       child.kill("SIGKILL");
       if (ws.readyState === ws.OPEN) ws.close(1000, reason);
     };
+    const shutdownRef = () => shutdown("desktop parked");
+    const set = bridges.get(botId) ?? new Set<() => void>();
+    set.add(shutdownRef);
+    bridges.set(botId, set);
 
     child.stdout.on("data", (chunk: Buffer) => {
       if (ws.readyState === ws.OPEN) ws.send(chunk, { binary: true });
