@@ -5,6 +5,7 @@
 // real app-server, it never exits on its own — the driver kills it.
 //
 //   FAKE_CODEX_MODE   happy (default) | approval | resume
+//   FAKE_CODEX_APPROVAL_COMMAND command requested in approval mode
 //   FAKE_CODEX_DUMP   path to write {argv, env, calls, decision} as JSON
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
@@ -76,7 +77,17 @@ process.stdin.on("data", (chunk) => {
         out({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
         notify("item/started", { item: { id: "i1", type: "commandExecution", command: "ls -la" } });
         if (mode === "approval") {
-          out({ jsonrpc: "2.0", id: 100, method: "execCommandApproval", params: { command: "rm -rf scratch" } });
+          const command = process.env.FAKE_CODEX_APPROVAL_COMMAND ?? "rm -rf scratch";
+          out({
+            jsonrpc: "2.0",
+            id: 100,
+            method: "item/commandExecution/requestApproval",
+            params: {
+              command: `/bin/bash -lc '${command}'`,
+              commandActions: [{ type: "unknown", command }],
+              proposedExecpolicyAmendment: [command.split(/\s+/, 1)[0]],
+            },
+          });
           // turn continues from the approval response handler above
         } else {
           finishTurn();

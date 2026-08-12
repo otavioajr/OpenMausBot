@@ -31,6 +31,14 @@ OMB_DOCKER_PROXY_IMAGE=openmausbot-router-proxy:latest
 
 Containers are named deterministically: `omb-bot-<bot-id>`.
 
+Every container and per-bot network is also labeled with
+`openmausbot.owner-id`, derived from the harness data directory. Startup reaping
+filters by this owner before considering a bot orphan. This is a hard safety
+boundary: two profiles or an E2E instance may share one Docker daemon, but can
+never park or delete each other's writable layers. Legacy resources without an
+owner label remain manually usable but are intentionally invisible to automatic
+reaping.
+
 ## Security model
 
 ```text
@@ -98,15 +106,31 @@ systemctl --user restart openmausbot
 On startup, the harness removes environments whose bot no longer exists and
 parks valid environments left running by a prior crash.
 
-## Current limitation
+## Graphical desktop and browser
 
-The self-hosted environment is terminal-only. There is no graphical desktop,
-screenshot stream, or browser/VNC panel yet. Computer-use can be added later
-without changing the lifecycle contract.
+When `OMB_DOCKER_DESKTOP=true`, Isolated bots use the graphical image:
 
-The agent has no direct outbound internet by design. Model access works through
-the private sidecar. Controlled git/npm/web egress can be introduced later via
-an allowlisted proxy if required.
+- Xvfb + Fluxbox provide one lightweight X11 desktop;
+- x11vnc binds only `127.0.0.1` inside the container;
+- the UI receives a continuous RFB stream through a short-lived WebSocket
+  ticket and reconnects automatically if the disposable bridge drops;
+- the agent observes the same display through discrete `botpc screenshot`
+  frames, then moves/clicks/types through the broker. Frames are model
+  perception, not a replacement for the user's live noVNC stream;
+- a server/container lock guarantees one input owner (`bot` or `human`).
+
+The official Google Chrome ARM64 build uses the sidecar's filtered SOCKS5
+listener. The agent still has no direct egress: the proxy permits public web
+ports 80/443 and rejects localhost, private, link-local, Tailscale, metadata,
+documentation and multicast ranges.
+
+`botpc screenshot/state/move/click/type/key/scroll/open` approval requests are
+auto-accepted only when Codex's parsed command action and exec-policy amendment
+both identify one simple `botpc` command. Shell metacharacters and `botpc exec`
+remain behind explicit user approval. Resumed Codex threads reapply
+`danger-full-access` because the outer hardened container is the sandbox;
+otherwise Codex falls back to bubblewrap, which cannot create namespaces under
+`cap-drop ALL` and `no-new-privileges`.
 
 ## Verification performed
 

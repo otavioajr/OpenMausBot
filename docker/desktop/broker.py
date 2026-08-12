@@ -67,6 +67,39 @@ def xdotool(args: list[str]) -> dict:
     return {"ok": True, "output": proc.stdout.strip()[:400]}
 
 
+def smooth_move(x: int, y: int) -> dict:
+    """Move over a short visible trajectory instead of teleporting.
+
+    VNC sends cursor position separately from framebuffer screenshots. A raw
+    xdotool mousemove followed immediately by click can happen between two
+    client paints, so the user sees the result but not the bot moving. Roughly
+    200 ms of smoothstep interpolation is visible without making automation
+    feel sluggish.
+    """
+    current = run(["xdotool", "getmouselocation", "--shell"])
+    values = {}
+    for line in current.stdout.splitlines():
+        key, _, value = line.partition("=")
+        if key in ("X", "Y") and value.lstrip("-").isdigit():
+            values[key] = int(value)
+    if "X" not in values or "Y" not in values:
+        return xdotool(["mousemove", "--sync", str(x), str(y)])
+
+    start_x, start_y = values["X"], values["Y"]
+    distance = max(abs(x - start_x), abs(y - start_y))
+    steps = max(4, min(18, distance // 35 + 1))
+    args: list[str] = []
+    for index in range(1, steps + 1):
+        t = index / steps
+        eased = t * t * (3 - 2 * t)
+        next_x = round(start_x + (x - start_x) * eased)
+        next_y = round(start_y + (y - start_y) * eased)
+        args.extend(["mousemove", "--sync", str(next_x), str(next_y)])
+        if index < steps:
+            args.extend(["sleep", "0.014"])
+    return xdotool(args)
+
+
 def handle(req: dict) -> dict:
     op = str(req.get("op") or "")
 
@@ -98,12 +131,12 @@ def handle(req: dict) -> dict:
         }
 
     if op == "move":
-        return xdotool(["mousemove", "--sync", str(int(req.get("x", 0))), str(int(req.get("y", 0)))])
+        return smooth_move(int(req.get("x", 0)), int(req.get("y", 0)))
 
     if op == "click":
         button = str(int(req.get("button", 1)))
         if "x" in req and "y" in req:
-            moved = xdotool(["mousemove", "--sync", str(int(req["x"])), str(int(req["y"]))])
+            moved = smooth_move(int(req["x"]), int(req["y"]))
             if not moved.get("ok"):
                 return moved
         clicks = max(1, min(3, int(req.get("clicks", 1))))

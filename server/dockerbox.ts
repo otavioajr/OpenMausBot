@@ -17,7 +17,10 @@
 //   - --cap-drop=ALL: nothing here needs raw capabilities
 //   - runs as uid 1000 (`ubuntu`), never root
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
+
+import { DATA_DIR } from "./config.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -25,6 +28,11 @@ export const IMAGE = process.env.OMB_DOCKER_IMAGE || "openmausbot-box:latest";
 export const PROXY_IMAGE = process.env.OMB_DOCKER_PROXY_IMAGE || "openmausbot-router-proxy:latest";
 export const DESKTOP_IMAGE = process.env.OMB_DOCKER_DESKTOP_IMAGE || "openmausbot-desktop:latest";
 const LABEL = "openmausbot.bot-id";
+const OWNER_LABEL = "openmausbot.owner-id";
+/** Separate harness profiles share one Docker daemon. Ownership must therefore
+ * come from the profile's data directory, not from a process-global label. */
+export const OWNER_ID =
+  process.env.OMB_DOCKER_OWNER_ID || createHash("sha256").update(DATA_DIR).digest("hex").slice(0, 16);
 
 /** Graphical desktops are opt-in: without the image built, isolated bots stay
  * terminal-only and every desktop route degrades to "unavailable". */
@@ -107,26 +115,39 @@ export async function dockerConfigured(): Promise<boolean> {
   return proxy.ok;
 }
 
-async function inspectContainer(name: string): Promise<DockerBox | null> {
+async function inspectContainer(name: string): Promise<(DockerBox & { ownerId: string }) | null> {
   // Inspect by exact name. `docker ps --filter name=…` is a regex/substring
   // filter and can select the wrong bot when ids share a prefix.
   const res = await docker([
     "container", "inspect", name,
-    "--format", `{{.Id}}|{{.State.Status}}|{{index .Config.Labels "openmausbot.desktop"}}`,
+    "--format", `{{.Id}}|{{.State.Status}}|{{index .Config.Labels "openmausbot.desktop"}}|{{index .Config.Labels "${OWNER_LABEL}"}}`,
   ]).catch(() => null);
   const line = res?.ok ? res.stdout.trim() : "";
   if (!line) return null;
-  const [containerId, state, desktop] = line.split("|");
+  const [containerId, state, desktop, ownerId] = line.split("|");
   return {
     name,
     containerId: containerId ?? null,
     state: state === "running" ? "running" : "stopped",
     hasDesktop: desktop === "true",
+    ownerId: ownerId ?? "",
   };
 }
 
+async function inspectNetworkOwner(name: string): Promise<string | null> {
+  const res = await docker([
+    "network", "inspect", name,
+    "--format", `{{index .Labels "${OWNER_LABEL}"}}`,
+  ], 10_000);
+  return res.ok ? res.stdout.trim() : null;
+}
+
 export async function findContainer(botId: string): Promise<DockerBox | null> {
-  return inspectContainer(containerNameFor(botId));
+  const container = await inspectContainer(containerNameFor(botId));
+  if (container?.ownerId && container.ownerId !== OWNER_ID) {
+    throw new Error(`container ${container.name} belongs to another OpenMausBot profile`);
+  }
+  return container;
 }
 
 async function ensureNetwork(botId: string): Promise<{ internal: string; egress: string }> {
@@ -134,10 +155,20 @@ async function ensureNetwork(botId: string): Promise<{ internal: string; egress:
   const egress = egressNetworkNameFor(botId);
   for (const [name, isInternal] of [[internal, true], [egress, false]] as const) {
     const inspect = await docker(["network", "inspect", name], 10_000);
-    if (inspect.ok) continue;
+    if (inspect.ok) {
+      const owner = await inspectNetworkOwner(name);
+      if (owner && owner !== OWNER_ID) {
+        throw new Error(`network ${name} belongs to another OpenMausBot profile`);
+      }
+      continue;
+    }
     const args = ["network", "create"];
     if (isInternal) args.push("--internal");
-    args.push("--label", `${LABEL}=${botId}`, "--driver", "bridge", name);
+    args.push(
+      "--label", `${LABEL}=${botId}`,
+      "--label", `${OWNER_LABEL}=${OWNER_ID}`,
+      "--driver", "bridge", name,
+    );
     const net = await docker(args, 30_000);
     if (!net.ok && !/already exists/i.test(net.stderr)) {
       throw new Error(`container network create failed: ${net.stderr.slice(0, 200)}`);
@@ -154,7 +185,11 @@ async function ensureProxy(
   const name = proxyNameFor(botId);
   // The proxy is stateless. Recreate it on every wake so a rotated key and any
   // network-policy changes take effect immediately.
-  if (await inspectContainer(name)) await docker(["rm", "-f", name], 30_000);
+  const oldProxy = await inspectContainer(name);
+  if (oldProxy?.ownerId && oldProxy.ownerId !== OWNER_ID) {
+    throw new Error(`container ${name} belongs to another OpenMausBot profile`);
+  }
+  if (oldProxy) await docker(["rm", "-f", name], 30_000);
 
   // `-e NINEROUTER_API_KEY` copies the value from this child process's env.
   // The value never appears in argv/logs and is visible only in the hardened
@@ -164,6 +199,7 @@ async function ensureProxy(
       "run", "-d",
       "--name", name,
       "--label", `${LABEL}=${botId}`,
+      "--label", `${OWNER_LABEL}=${OWNER_ID}`,
       "--label", "openmausbot.role=router-proxy",
       "--restart", "no",
       "--cpus", "0.25",
@@ -255,6 +291,7 @@ export async function provisionContainer(
     "run", "-d",
     "--name", name,
     "--label", `${LABEL}=${botId}`,
+    "--label", `${OWNER_LABEL}=${OWNER_ID}`,
     "--label", "openmausbot.role=agent",
     "--label", `openmausbot.bot-name=${botName.slice(0, 60)}`,
     "--restart", "no",
@@ -326,6 +363,7 @@ export async function sleepContainer(botId: string): Promise<{ ok: boolean }> {
   await Promise.all(
     names.map(async (name) => {
       const box = await inspectContainer(name);
+      if (box?.ownerId && box.ownerId !== OWNER_ID) return;
       if (box?.state === "running") await docker(["stop", "-t", "5", name], 30_000);
     }),
   );
@@ -340,6 +378,23 @@ export async function destroyContainer(botId: string): Promise<{ ok: boolean; re
   const networks = [networkNameFor(botId), egressNetworkNameFor(botId)];
   const existing = await findContainer(botId);
   const failures: string[] = [];
+
+  // Check the whole environment before deleting any part of it. A foreign or
+  // mixed-owner environment fails atomically rather than losing a container
+  // and only then discovering that one of its networks belongs elsewhere.
+  for (const name of [agent, proxy]) {
+    const container = await inspectContainer(name);
+    if (container?.ownerId && container.ownerId !== OWNER_ID) {
+      throw new Error(`container ${name} belongs to another OpenMausBot profile`);
+    }
+  }
+  for (const network of networks) {
+    const owner = await inspectNetworkOwner(network);
+    if (owner && owner !== OWNER_ID) {
+      throw new Error(`network ${network} belongs to another OpenMausBot profile`);
+    }
+  }
+
   for (const [role, name] of [["agent", agent], ["proxy", proxy]] as const) {
     const container = await inspectContainer(name);
     if (!container) continue;
@@ -403,9 +458,17 @@ export async function containerStatus(botId: string) {
   };
 }
 
-/** Bot ids that currently own a container — used to reap orphans at boot. */
+/** Bot ids owned by THIS harness profile — used to reap orphans at boot.
+ * Docker is host-global, but bot stores are profile-local. Never enumerate a
+ * generic `openmausbot.bot-id` label here: another profile would then consider
+ * every foreign bot an orphan and destroy its writable layer. */
 export async function listManagedBotIds(): Promise<string[]> {
-  const res = await docker(["ps", "-a", "--filter", `label=${LABEL}`, "--format", `{{.Label "${LABEL}"}}`]);
+  const res = await docker([
+    "ps", "-a",
+    "--filter", `label=${LABEL}`,
+    "--filter", `label=${OWNER_LABEL}=${OWNER_ID}`,
+    "--format", `{{.Label "${LABEL}"}}`,
+  ]);
   return [...new Set(res.stdout.trim().split("\n").filter(Boolean))];
 }
 

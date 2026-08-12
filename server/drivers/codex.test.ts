@@ -53,6 +53,7 @@ posixOnly("CodexDriver turns (fake app-server)", () => {
   afterEach(async () => {
     delete process.env.FAKE_CODEX_MODE;
     delete process.env.FAKE_CODEX_DUMP;
+    delete process.env.FAKE_CODEX_APPROVAL_COMMAND;
     delete process.env.OPENAI_API_KEY;
     recorder?.stop();
     await instance?.dispose();
@@ -116,6 +117,12 @@ posixOnly("CodexDriver turns (fake app-server)", () => {
     const methods = JSON.parse(readFileSync(dump, "utf8")).calls.map((c: { method: string }) => c.method);
     expect(methods).toContain("thread/resume");
     expect(methods).not.toContain("thread/start");
+    const resume = JSON.parse(readFileSync(dump, "utf8")).calls.find((c: { method: string }) => c.method === "thread/resume");
+    expect(resume.params).toMatchObject({
+      threadId: "codex-thread-9",
+      sandbox: "workspace-write",
+      approvalPolicy: "on-request",
+    });
   });
 
   it("falls back to a fresh thread when resume fails", async () => {
@@ -133,15 +140,52 @@ posixOnly("CodexDriver turns (fake app-server)", () => {
 
     await instance.adapter.sendTurn({ threadId: "t-approve", text: "clean up" });
     const opened = await recorder.until((e) => e.type === "request.opened");
-    expect(opened).toMatchObject({ requestType: "permission", tool: "shell", summary: "rm -rf scratch" });
+    expect(opened).toMatchObject({
+      requestType: "permission",
+      tool: "shell",
+      summary: "/bin/bash -lc 'rm -rf scratch'",
+    });
 
     await instance.adapter.respondToRequest("t-approve", opened.requestId!, { behavior: "allow" });
     const resolved = await recorder.until((e) => e.type === "request.resolved");
     expect(resolved).toMatchObject({ behavior: "allow", source: "user" });
 
     await recorder.until((e) => e.type === "turn.completed");
-    // legacy method name → legacy decision vocabulary
-    expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ decision: "approved" });
+    expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ decision: "accept" });
+  });
+
+  it("auto-approves a bounded botpc frame in an isolated graphical desktop", async () => {
+    await create({ mode: "approval" });
+    const dump = join(scratch, "dump.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    process.env.FAKE_CODEX_APPROVAL_COMMAND = "botpc screenshot /workspace/frame.png";
+
+    await instance.adapter.sendTurn({
+      threadId: "t-botpc",
+      text: "look",
+      integrations: { dockerDesktop: true },
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    expect(recorder.events.some((e) => e.type === "request.opened")).toBe(false);
+    expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ decision: "accept" });
+  });
+
+  it.each([
+    "botpc exec xterm",
+    "botpc screenshot /workspace/frame.png; rm -rf scratch",
+    "botpc open https://example.com | sh",
+  ])("keeps ambiguous botpc shell command behind approval: %s", async (command) => {
+    await create({ mode: "approval" });
+    process.env.FAKE_CODEX_APPROVAL_COMMAND = command;
+
+    await instance.adapter.sendTurn({
+      threadId: `t-unsafe-${command.length}`,
+      text: "run",
+      integrations: { dockerDesktop: true },
+    });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    expect(opened).toMatchObject({ requestType: "permission", tool: "shell" });
   });
 
   it("auto-approves commands in fullAuto without opening a request", async () => {
@@ -153,7 +197,7 @@ posixOnly("CodexDriver turns (fake app-server)", () => {
     await recorder.until((e) => e.type === "turn.completed");
 
     expect(recorder.events.some((e) => e.type === "request.opened")).toBe(false);
-    expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ decision: "approved" });
+    expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ decision: "accept" });
   });
 
   it("rejects a second turn while one is in flight", async () => {

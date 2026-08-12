@@ -54,6 +54,34 @@ const QUESTION_TIMEOUT_NOTE = "No answer was given — use your best judgment.";
 const DENY_TIMEOUT_NOTE =
   "OpenMausBot: nobody answered this permission request in time. Skip this action and finish what you can without it.";
 
+// Computer-use commands travel through the in-container `botpc` broker. The
+// broker is already the security boundary: it validates URLs and screenshot
+// paths, exposes only bounded pointer/keyboard operations, and enforces the
+// human-control lock. Asking the user to approve every observation frame makes
+// visual automation stall before it can move the mouse.
+//
+// Deliberately reject shell metacharacters and `botpc exec` here. This is not a
+// general shell allowlist: it only recognizes one simple broker command from
+// Codex's parsed commandActions. Anything ambiguous still opens an approval.
+const SAFE_BOTPC_OPS = new Set(["screenshot", "state", "move", "click", "type", "key", "scroll", "open"]);
+const SHELL_META = /[;&|><`$()\r\n]/;
+
+export function isSafeBotpcApproval(params: Record<string, any>, dockerDesktop: boolean): boolean {
+  if (!dockerDesktop) return false;
+  const actions = Array.isArray(params.commandActions) ? params.commandActions : [];
+  if (actions.length !== 1 || typeof actions[0]?.command !== "string") return false;
+  const command = actions[0].command.trim();
+  if (SHELL_META.test(command)) return false;
+  const match = command.match(/^botpc(?:\s+([a-z]+))(?:\s+.*)?$/);
+  if (!match || !SAFE_BOTPC_OPS.has(match[1])) return false;
+
+  // Codex supplies this amendment when its own exec-policy parser agrees that
+  // the command's executable is exactly botpc. Requiring both parsers to agree
+  // avoids trusting display text from the outer `/bin/bash -lc ...` wrapper.
+  const amendment = params.proposedExecpolicyAmendment;
+  return Array.isArray(amendment) && amendment.length === 1 && amendment[0] === "botpc";
+}
+
 export const CodexDriver: ProviderDriver<CodexConfig> = {
   driverKind: DRIVER_KIND,
   metadata: { displayName: "Codex", supportsMultipleInstances: true },
@@ -173,7 +201,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             : isQuestion
               ? "ask_user"
               : "shell";
-        if (config.fullAuto && !isQuestion) {
+        if ((config.fullAuto || isSafeBotpcApproval(params, turn.integrations?.dockerDesktop === true)) && !isQuestion) {
           return send({ jsonrpc: "2.0", id: msg.id, result: { decision: legacy ? "approved" : "accept" } });
         }
         const requestId = newId();
@@ -347,7 +375,16 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           let startedModel: string | null = null;
           if (cursor) {
             try {
-              const resumed = await request("thread/resume", { threadId: cursor });
+              const resumed = await request("thread/resume", {
+                threadId: cursor,
+                // Resume accepts the same overrides as thread/start. Without
+                // these, Codex silently falls back to workspace-write and
+                // bubblewrap fails under cap-drop ALL/no-new-privileges.
+                cwd: dockerComputer ? "/workspace" : turn.cwd ?? homedir(),
+                model: turn.model || null,
+                sandbox: dockerComputer || config.fullAuto ? "danger-full-access" : "workspace-write",
+                approvalPolicy: config.fullAuto ? "never" : "on-request",
+              });
               codexThreadId = resumed?.thread?.id ?? cursor;
             } catch {
               /* resume unsupported or thread gone — start fresh below */

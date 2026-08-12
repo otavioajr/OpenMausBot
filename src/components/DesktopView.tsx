@@ -26,6 +26,10 @@ export function DesktopView({ botId, botName, running, onWake }: Props) {
   const modalHost = useRef<HTMLDivElement | null>(null);
   const rfb = useRef<RFB | null>(null);
   const canvasHolder = useRef<HTMLDivElement | null>(null);
+  const connectRef = useRef<() => Promise<void>>(async () => {});
+  const reconnectTimer = useRef<number | null>(null);
+  const reconnectAttempt = useRef(0);
+  const allowReconnect = useRef(false);
   const [expanded, setExpanded] = useState(false);
   const [control, setControl] = useState<Control>("bot");
   const [status, setStatus] = useState<"idle" | "connecting" | "live" | "error">("idle");
@@ -55,25 +59,61 @@ export function DesktopView({ botId, botName, running, onWake }: Props) {
       client.scaleViewport = true;
       client.resizeSession = false;
       client.background = "#0d1117";
-      client.addEventListener("connect", () => setStatus("live"));
+      client.addEventListener("connect", () => {
+        if (reconnectTimer.current !== null) window.clearTimeout(reconnectTimer.current);
+        reconnectTimer.current = null;
+        reconnectAttempt.current = 0;
+        setError(null);
+        setStatus("live");
+      });
       client.addEventListener("disconnect", (event: Event) => {
         rfb.current = null;
+        if (canvasHolder.current === holder) canvasHolder.current = null;
+        holder.remove();
         const clean = (event as CustomEvent<{ clean?: boolean }>).detail?.clean;
-        setStatus(clean ? "idle" : "error");
-        if (!clean) setError("the desktop stream dropped");
+        if (!allowReconnect.current) {
+          setStatus(clean ? "idle" : "error");
+          if (!clean) setError("the desktop stream dropped");
+          return;
+        }
+
+        // A VNC bridge is a disposable `docker exec socat` process. It may end
+        // cleanly while the desktop itself keeps running (wake, brief Docker
+        // hiccup, browser tab suspension). A fresh connection needs a fresh
+        // single-use ticket; retry instead of parking forever at "idle".
+        setStatus("connecting");
+        setError(clean ? null : "the desktop stream dropped — reconnecting");
+        const delay = Math.min(10_000, 500 * 2 ** reconnectAttempt.current++);
+        reconnectTimer.current = window.setTimeout(() => void connectRef.current(), delay);
       });
       rfb.current = client;
     } catch (e) {
-      setStatus("error");
-      setError(String(e instanceof Error ? e.message : e));
+      const message = String(e instanceof Error ? e.message : e);
+      if (allowReconnect.current) {
+        setStatus("connecting");
+        setError(`${message} — reconnecting`);
+        const delay = Math.min(10_000, 500 * 2 ** reconnectAttempt.current++);
+        reconnectTimer.current = window.setTimeout(() => void connectRef.current(), delay);
+      } else {
+        setStatus("error");
+        setError(message);
+      }
     }
   }, [botId, expanded, running]);
 
+  connectRef.current = connect;
+
   useEffect(() => {
-    if (running) void connect();
+    allowReconnect.current = running;
+    if (running) void connectRef.current();
     return () => {
+      allowReconnect.current = false;
+      if (reconnectTimer.current !== null) window.clearTimeout(reconnectTimer.current);
+      reconnectTimer.current = null;
       rfb.current?.disconnect();
       rfb.current = null;
+      canvasHolder.current?.remove();
+      canvasHolder.current = null;
     };
     // Reconnect only when the bot or its running state changes.
   }, [botId, running]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -132,11 +172,13 @@ export function DesktopView({ botId, botName, running, onWake }: Props) {
         ? "You're in control"
         : "Bot controlling"
       : status === "connecting"
-        ? "Starting the desktop…"
+        ? reconnectAttempt.current
+          ? "Reconnecting live desktop…"
+          : "Starting the live desktop…"
         : status === "error"
           ? (error ?? "Desktop unavailable")
           : running
-            ? "Desktop idle"
+            ? "Live desktop disconnected — reconnecting…"
             : "Stopped — wakes on the next turn";
 
   return (
