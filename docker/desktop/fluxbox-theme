@@ -1,0 +1,72 @@
+! Light, rounded-ish Fluxbox theme approximating macOS window chrome:
+! thin light titlebar, dark centered title, subtle borders, no gradients that
+! look dated. Kept to plain colors — no pixmaps — so it costs nothing to draw.
+
+*.font:                                 Inter Medium 9
+*textureType:                           Flat Solid
+
+background:                             flat
+background.color:                       #eceef2
+
+! ── window frame ──
+window.title.focus.color:               #f2f3f5
+window.title.unfocus.color:             #e9eaee
+window.label.focus.color:               #f2f3f5
+window.label.unfocus.color:             #e9eaee
+window.label.focus.textColor:           #1d1d1f
+window.label.unfocus.textColor:         #8b8b90
+window.label.focus.font:                Inter Medium 9
+window.justify:                         Center
+
+window.handle.focus.color:              #f2f3f5
+window.handle.unfocus.color:            #e9eaee
+window.grip.focus.color:                #dcdde1
+window.grip.unfocus.color:              #e9eaee
+window.frame.focusColor:                #d7d8dd
+window.frame.unfocusColor:              #e2e3e7
+
+window.borderWidth:                     1
+window.borderColor:                     #c9cad0
+window.title.height:                    26
+window.handleWidth:                     1
+window.bevelWidth:                      1
+
+! ── traffic-light-ish buttons ──
+window.close.focus.color:               #ff5f57
+window.close.unfocus.color:             #dfdfe3
+window.close.pressed.color:             #e0443e
+window.iconify.focus.color:             #febc2e
+window.iconify.unfocus.color:           #dfdfe3
+window.iconify.pressed.color:           #dea123
+window.maximize.focus.color:            #28c840
+window.maximize.unfocus.color:          #dfdfe3
+window.maximize.pressed.color:          #1dad2b
+window.stick.focus.color:               #dfdfe3
+window.stick.unfocus.color:             #dfdfe3
+window.shade.focus.color:               #dfdfe3
+window.shade.unfocus.color:             #dfdfe3
+
+window.button.focus.picColor:           #f2f3f5
+window.button.unfocus.picColor:         #dfdfe3
+window.button.pressed.picColor:         #ffffff
+
+! ── menu ──
+menu.title.color:                       #f2f3f5
+menu.title.textColor:                   #1d1d1f
+menu.title.justify:                     Center
+menu.title.height:                      24
+menu.frame.color:                       #f7f8fa
+menu.frame.textColor:                   #1d1d1f
+menu.frame.disableColor:                #b0b0b6
+menu.frame.justify:                     Left
+menu.hilite.color:                      #0a84ff
+menu.hilite.textColor:                  #ffffff
+menu.bevelWidth:                        3
+menu.borderWidth:                       1
+menu.borderColor:                       #d7d8dd
+menu.bullet:                            triangle
+menu.bullet.position:                   right
+
+! ── misc chrome ──
+toolbar.visible:                        false
+slit.borderWidth:                       0

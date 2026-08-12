@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Terminal
+Comment=Shell inside the bot's environment
+Exec=lxterminal
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;

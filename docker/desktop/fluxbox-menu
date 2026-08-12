@@ -1,8 +1,9 @@
-[begin] (bot desktop)
-  [exec] (Terminal) {xterm -fa Monospace -fs 11 -bg #101317 -fg #e6e6e6}
+[begin] (Desktop)
+  [exec] (Terminal) {lxterminal}
   [exec] (Browser) {epiphany-browser}
-  [exec] (Files) {pcmanfm}
+  [exec] (Files) {pcmanfm /workspace}
   [separator]
-  [workspaces] (Workspaces)
-  [restart] (Restart window manager)
+  [exec] (Screenshot to /workspace) {sh -c 'scrot /workspace/screenshot-%Y%m%d-%H%M%S.png'}
+  [separator]
+  [restart] (Restart desktop)
 [end]

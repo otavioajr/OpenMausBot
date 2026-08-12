@@ -19,6 +19,10 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
       xvfb x11vnc fluxbox xterm xdotool scrot xauth x11-utils x11-xserver-utils \
       socat util-linux iproute2 \
       fonts-dejavu-core fonts-liberation \
+      # cosmetics: panel/dock, compositor, wallpaper setter, themed terminal,
+      # GTK theme and the UI font. ~30 MB total, no desktop-environment daemons.
+      # (papirus-icon-theme was rejected on purpose: 195 MB for icons alone.)
+      tint2 picom hsetroot lxterminal arc-theme fonts-inter \
       # a light browser so GUI work has something real to do
       epiphany-browser \
       # light file manager, handy when a human takes over
@@ -55,7 +59,24 @@ COPY --chown=ubuntu:ubuntu codex-config.toml /home/ubuntu/.codex/config.toml
 COPY desktop/broker.py /opt/omb/broker.py
 COPY desktop/start-desktop.sh /opt/omb/start-desktop.sh
 COPY desktop/botpc /usr/local/bin/botpc
+COPY desktop/make-wallpaper.py /opt/omb/make-wallpaper.py
+
+# Look and feel. All of it is static config owned by the desktop user: window
+# theme, panel/dock, launchers, terminal palette, GTK settings.
 COPY --chown=desktop:desktop desktop/fluxbox-menu /home/desktop/.fluxbox/menu
+COPY --chown=desktop:desktop desktop/fluxbox-init /home/desktop/.fluxbox/init
+COPY --chown=desktop:desktop desktop/fluxbox-theme /home/desktop/.fluxbox/styles/omb
+COPY --chown=desktop:desktop desktop/tint2-topbar.conf /home/desktop/.config/tint2/topbar.conf
+COPY --chown=desktop:desktop desktop/tint2-dock.conf /home/desktop/.config/tint2/dock.conf
+COPY --chown=desktop:desktop desktop/launchers/ /home/desktop/.local/share/applications/
+COPY --chown=desktop:desktop desktop/lxterminal.conf /home/desktop/.config/lxterminal/lxterminal.conf
+COPY --chown=desktop:desktop desktop/gtk-settings.ini /home/desktop/.config/gtk-3.0/settings.ini
+
+# Render the wallpaper at build time: a few KB of generated gradient instead of
+# a multi-megabyte photo or a network fetch during the build.
+RUN mkdir -p /usr/share/backgrounds \
+    && python3 /opt/omb/make-wallpaper.py /usr/share/backgrounds/omb.png \
+    && chmod 0644 /usr/share/backgrounds/omb.png
 # Fluxbox shells out to fbsetbg for the wallpaper and pops a blocking
 # xmessage when no setter is found. Two guards: provide the Esetroot setter it
 # looks for first, and neuter xmessage so a stray dialog can never sit on the
