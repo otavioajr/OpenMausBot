@@ -4,7 +4,7 @@
 // initialize/thread/turn handshake, then plays a scripted turn. Like the
 // real app-server, it never exits on its own — the driver kills it.
 //
-//   FAKE_CODEX_MODE   happy (default) | approval | resume
+//   FAKE_CODEX_MODE   happy (default) | approval | resume | bubblewrap-exit
 //   FAKE_CODEX_APPROVAL_COMMAND command requested in approval mode
 //   FAKE_CODEX_DUMP   path to write {argv, env, calls, decision} as JSON
 //
@@ -76,7 +76,10 @@ process.stdin.on("data", (chunk) => {
       case "turn/start":
         out({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
         notify("item/started", { item: { id: "i1", type: "commandExecution", command: "ls -la" } });
-        if (mode === "approval") {
+        if (mode === "bubblewrap-exit") {
+          process.stderr.write("Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager.\n");
+          process.exit(0);
+        } else if (mode === "approval") {
           const command = process.env.FAKE_CODEX_APPROVAL_COMMAND ?? "rm -rf scratch";
           out({
             jsonrpc: "2.0",

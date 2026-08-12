@@ -256,8 +256,14 @@ bus.subscribe((event: RuntimeEvent) => {
         // Keep the composer locked until agent + proxy are actually parked;
         // otherwise the UI can say "finished" while Docker still reports
         // running for a few milliseconds (and a fast next turn races stop).
-        void dockerbox
-          .sleepContainer(bot.id)
+        let parkedState: "paused" | "stopped" = "stopped";
+        void desktop
+          .releaseControl(bot.id)
+          .catch(() => ({ control: "bot" as const }))
+          .then(() => dockerbox.sleepContainer(bot.id))
+          .then((result) => {
+            parkedState = result.state;
+          })
           .catch((error) => {
             pushMessage({
               role: "bot",
@@ -268,7 +274,7 @@ bus.subscribe((event: RuntimeEvent) => {
           .finally(() => {
             store.patchBot(bot.id, { busy: false, unread: true });
             broadcast({ kind: "bot", bot: store.bot(bot.id) });
-            broadcast({ kind: "computer", botId: bot.id, state: "stopped" });
+            broadcast({ kind: "computer", botId: bot.id, state: parkedState });
           });
       } else {
         store.patchBot(bot.id, { busy: false, unread: true });
@@ -795,7 +801,11 @@ const server = createServer(async (req, res) => {
             ? await dockerbox.provisionContainer(bot.id, bot.name)
             : await dockerbox.findContainer(bot.id);
           if (!box || box.state !== "running") {
-            return json(res, 409, { error: "the desktop is not running", stopped: true });
+            return json(res, 409, {
+              error: "the desktop is not running",
+              stopped: true,
+              state: box?.state ?? "missing",
+            });
           }
           if (!box.hasDesktop) {
             return json(res, 409, {
@@ -803,6 +813,7 @@ const server = createServer(async (req, res) => {
               upgradable: true,
             });
           }
+          if (mayWake) broadcast({ kind: "computer", botId: bot.id, state: "running" });
           return json(res, 200, { ...desktop.issueDesktopTicket(bot.id), control: desktop.controlState(bot.id) });
         }
         case "control": {
@@ -838,6 +849,7 @@ const server = createServer(async (req, res) => {
         switch (m[2]) {
           case "provision": {
             const env = await dockerbox.provisionContainer(botId, bot.name);
+            broadcast({ kind: "computer", botId, state: env.state });
             return json(res, 200, {
               boxId: env.name,
               machineName: env.name,
@@ -852,7 +864,15 @@ const server = createServer(async (req, res) => {
           case "join":
             return json(res, 409, { error: "This self-hosted environment is terminal-only — desktop UI can be added later" });
           case "sleep":
-            return json(res, 200, await dockerbox.sleepContainer(botId));
+            if (bot.busy) {
+              return json(res, 409, { error: "The bot is still working — interrupt the turn before pausing its desktop." });
+            }
+            await desktop.releaseControl(botId).catch(() => ({ control: "bot" as const }));
+            {
+              const result = await dockerbox.sleepContainer(botId);
+              broadcast({ kind: "computer", botId, state: result.state });
+              return json(res, 200, result);
+            }
           case "exec": {
             const body = await readBody(req);
             return json(res, 200, await dockerbox.execInContainer(botId, String(body.command ?? ""), { botName: bot.name }));

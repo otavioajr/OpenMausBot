@@ -101,6 +101,8 @@ interface AppState {
   screens: Record<string, { png: string; mime: string }>;
   /** bots whose cloud computer is being provisioned */
   provisioning: Record<string, boolean>;
+  /** last lifecycle state broadcast for each isolated computer */
+  computerStates: Record<string, string>;
   connected: boolean;
   error: string | null;
   mascotMotion: {
@@ -130,6 +132,7 @@ type Action =
   | { type: "streamClear"; threadId: string }
   | { type: "screenFrame"; botId: string; png: string; mime: string }
   | { type: "provisioning"; botId: string; on: boolean }
+  | { type: "computerState"; botId: string; state: string }
   | { type: "setModel"; botId: string; selection: ModelSelection }
   | { type: "interrupt"; botId: string }
   | { type: "connected"; value: boolean }
@@ -301,6 +304,12 @@ function reducer(state: AppState, action: Action): AppState {
         ...(action.on ? withMascotMotion(state, action.botId, "launch") : state),
         provisioning: { ...state.provisioning, [action.botId]: action.on },
       };
+    case "computerState":
+      return {
+        ...state,
+        provisioning: { ...state.provisioning, [action.botId]: action.state === "provisioning" },
+        computerStates: { ...state.computerStates, [action.botId]: action.state },
+      };
     case "setModel":
       return updateBot(state, action.botId, (b) => ({ ...b, modelSelection: action.selection }));
     case "connected":
@@ -376,6 +385,7 @@ const initialState: AppState = {
   streaming: {},
   screens: {},
   provisioning: {},
+  computerStates: {},
   connected: false,
   error: null,
   mascotMotion: null,
@@ -599,7 +609,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           rawDispatch({ type: "screenFrame", botId: frame.botId, png: frame.png, mime: frame.mime ?? "image/png" });
           break;
         case "computer":
-          rawDispatch({ type: "provisioning", botId: frame.botId, on: frame.state === "provisioning" });
+          rawDispatch({ type: "computerState", botId: frame.botId, state: frame.state });
           break;
         case "bot.deleted":
           rawDispatch({ type: "deleteBot", botId: frame.botId });

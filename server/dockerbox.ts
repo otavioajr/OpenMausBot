@@ -5,8 +5,8 @@
 //
 // Design mirrors box.ts on purpose so both can sit behind one call site:
 //   - deterministic per-bot names (a bot always re-finds its own container)
-//   - stop/start instead of create/destroy: stopping frees CPU+RAM while the
-//     capped writable layer (/workspace + Codex sessions) survives
+//   - graphical bots use pause/unpause so Chrome, windows and X11 state survive;
+//     terminal-only bots use stop/start to release memory
 //   - destroy() is the only path that deletes state, and it is wired to bot
 //     deletion so an environment never outlives its bot
 //
@@ -58,7 +58,7 @@ const LIMITS = {
   storage: process.env.OMB_DOCKER_STORAGE || "10G",
 };
 
-export type BoxState = "running" | "stopped" | "missing";
+export type BoxState = "running" | "paused" | "stopped" | "missing";
 
 export interface DockerBox {
   name: string;
@@ -128,7 +128,7 @@ async function inspectContainer(name: string): Promise<(DockerBox & { ownerId: s
   return {
     name,
     containerId: containerId ?? null,
-    state: state === "running" ? "running" : "stopped",
+    state: state === "running" ? "running" : state === "paused" ? "paused" : "stopped",
     hasDesktop: desktop === "true",
     ownerId: ownerId ?? "",
   };
@@ -256,11 +256,17 @@ export async function provisionContainer(
   const wantDesktop = opts.desktop ?? desktopEnabled();
   const name = containerNameFor(botId);
   const networks = await ensureNetwork(botId);
-  await ensureProxy(botId, routerKey, networks);
   const existing = await findContainer(botId);
 
   if (existing) {
-    if (existing.state !== "running") {
+    // Restore egress first while a graphical agent is still frozen. Chrome then
+    // resumes into a ready network instead of briefly observing an offline
+    // proxy and replacing the current page with an error.
+    await ensureProxy(botId, routerKey, networks);
+    if (existing.state === "paused") {
+      const resumed = await docker(["unpause", name], 60_000);
+      if (!resumed.ok) throw new Error(`could not resume the container: ${resumed.stderr.slice(0, 200)}`);
+    } else if (existing.state !== "running") {
       const started = await docker(["start", name], 60_000);
       if (!started.ok) throw new Error(`could not wake the container: ${started.stderr.slice(0, 200)}`);
     }
@@ -287,6 +293,7 @@ export async function provisionContainer(
         "--pids-limit", LIMITS.pids,
       ];
 
+  await ensureProxy(botId, routerKey, networks);
   const created = await docker([
     "run", "-d",
     "--name", name,
@@ -357,17 +364,39 @@ async function ensureRunning(botId: string, botName = "bot"): Promise<DockerBox>
   return provisionContainer(botId, botName);
 }
 
-/** Stop agent + private router: frees CPU/RAM, keeps the agent filesystem. */
-export async function sleepContainer(botId: string): Promise<{ ok: boolean }> {
-  const names = [containerNameFor(botId), proxyNameFor(botId)];
-  await Promise.all(
-    names.map(async (name) => {
-      const box = await inspectContainer(name);
-      if (box?.ownerId && box.ownerId !== OWNER_ID) return;
-      if (box?.state === "running") await docker(["stop", "-t", "5", name], 30_000);
-    }),
-  );
-  return { ok: true };
+/** Park an environment without deleting its writable layer.
+ *
+ * Graphical agents are paused so X11, Chrome tabs, login sessions, window
+ * positions and cursor state remain in memory exactly as the user left them.
+ * The stateless credential sidecar is still stopped and recreated on wake.
+ * Terminal-only agents use stop/start because they have no volatile GUI state
+ * worth retaining and can release all memory while idle. */
+export async function sleepContainer(botId: string): Promise<{ ok: boolean; state: "paused" | "stopped" }> {
+  const agent = await inspectContainer(containerNameFor(botId));
+  const proxy = await inspectContainer(proxyNameFor(botId));
+  for (const box of [agent, proxy]) {
+    if (box?.ownerId && box.ownerId !== OWNER_ID) {
+      throw new Error(`container ${box.name} belongs to another OpenMausBot profile`);
+    }
+  }
+
+  let state: "paused" | "stopped" = agent?.hasDesktop ? "paused" : "stopped";
+  if (agent?.state === "running") {
+    const parked = agent.hasDesktop
+      ? await docker(["pause", agent.name], 30_000)
+      : await docker(["stop", "-t", "5", agent.name], 30_000);
+    if (!parked.ok) throw new Error(`could not park the container: ${parked.stderr.slice(0, 200)}`);
+  } else if (agent?.state === "paused") {
+    state = "paused";
+  }
+
+  // The router has no user state. Stop it after the agent is frozen so no
+  // Chrome request can race the loss of egress during parking.
+  if (proxy?.state === "running") {
+    const stopped = await docker(["stop", "-t", "5", proxy.name], 30_000);
+    if (!stopped.ok) throw new Error(`could not stop the router proxy: ${stopped.stderr.slice(0, 200)}`);
+  }
+  return { ok: true, state };
 }
 
 /** Delete agent + proxy + networks. The writable layer dies with the agent;

@@ -209,6 +209,18 @@ posixOnly("CodexDriver turns (fake app-server)", () => {
     await recorder.until((e) => e.type === "turn.completed");
   });
 
+  it("does not misreport the startup bubblewrap warning as an exit cause", async () => {
+    await create({ mode: "bubblewrap-exit" });
+    await instance.adapter.sendTurn({ threadId: "t-external-exit", text: "go" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+
+    expect(done).toMatchObject({ ok: false, stopReason: "exit_before_result" });
+    const error = recorder.events.find((e) => e.type === "runtime.error")!;
+    expect(error.message).toContain("ended before turn/completed (exit code 0)");
+    expect(error.message).toContain("may have been interrupted externally");
+    expect(error.message).not.toContain("bubblewrap");
+  });
+
   it("a missing binary surfaces as a failed turn, and snapshot says unavailable", async () => {
     instance = await CodexDriver.create({
       instanceId: "codex-missing",

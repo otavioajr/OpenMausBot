@@ -54,6 +54,13 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
   // bumped when a Box token is saved inline, to re-run the spin-up flow
   const [retry, setRetry] = useState(0);
 
+  // Lifecycle transitions also arrive over SSE (turn start/end, another tab,
+  // automatic parking). Keep the panel and its noVNC child in sync immediately.
+  useEffect(() => {
+    const next = state.computerStates[bot.id];
+    if (next) setBoxState(next);
+  }, [state.computerStates, bot.id]);
+
   // resolve the mode on open; box endpoints are only ever hit on the
   // cloud path, so local/off can never render a JSON error as an image
   useEffect(() => {
@@ -189,7 +196,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
       .then((result) => {
         // the join URL's stream token rotates — always freshly minted, never cached
         if (kind === "join" && result.joinUrl) window.open(result.joinUrl);
-        if (kind === "sleep") setBoxState(computerKind === "docker" ? "stopped" : "archived");
+        if (kind === "sleep") setBoxState(computerKind === "docker" ? (result.state ?? "stopped") : "archived");
         if (kind === "provision") setBoxState(result.state ?? "running");
         if (kind === "desktop-upgrade") {
           setHasDesktop(Boolean(result.hasDesktop));
@@ -245,6 +252,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
             botId={bot.id}
             botName={bot.name}
             running={boxState === "running"}
+            paused={boxState === "paused"}
             onWake={() => run("provision")}
           />
         ) : (
@@ -262,7 +270,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
               )}
               <span className="text-[12px]">
                 {phase === "docker"
-                  ? `Isolated Linux container · ${boxState === "running" ? "running" : "stopped"}. It wakes automatically on the next Codex turn.`
+                  ? `Isolated Linux container · ${boxState === "running" ? "running" : boxState === "paused" ? "paused with desktop state preserved" : "stopped"}. It wakes automatically on the next Codex turn.`
                   : phase === "ready"
                     ? "Waiting for the first frame…"
                     : phase === "local"
@@ -361,11 +369,12 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
             {boxState === "running" && (
               <button
                 onClick={() => run("sleep")}
-                disabled={pending === "sleep"}
+                disabled={pending === "sleep" || Boolean(bot.busy)}
                 className="mt-3 flex items-center gap-2 rounded-lg bg-raised px-3 py-2 text-[13px] text-ink hover:bg-raised-hover disabled:opacity-50"
+                title={bot.busy ? "Interrupt the current turn before pausing the desktop" : "Pause while preserving Chrome, tabs and windows"}
               >
                 {pending === "sleep" ? <Loader2 size={14} className="animate-spin" /> : <Moon size={14} />}
-                Stop now
+                {hasDesktop ? "Pause now" : "Stop now"}
               </button>
             )}
           </div>

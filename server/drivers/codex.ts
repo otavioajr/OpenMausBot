@@ -351,12 +351,25 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         emit({ ...base(threadId, turnId), type: "runtime.error", message: `spawn failed: ${e.message}` });
         settle(false, "spawn_error");
       });
-      child.on("close", (code) => {
+      child.on("close", (code, signal) => {
         if (!state.settled) {
+          // Codex prints configuration warnings (notably the bubblewrap PATH
+          // notice) at startup even when danger-full-access is selected and
+          // commands work normally. Do not present that stale warning as the
+          // cause when the app-server is later interrupted for another reason.
+          const detail = stderr
+            .split("\n")
+            .map((line) => line.trim())
+            .filter(Boolean)
+            .filter((line) => !line.includes("Codex could not find bubblewrap on PATH"))
+            .slice(-3)
+            .join(" | ")
+            .slice(-300);
+          const exit = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
           emit({
             ...base(threadId, turnId),
             type: "runtime.error",
-            message: `codex exited ${code} before turn/completed${stderr ? `: ${stderr.trim().slice(-300)}` : ""}`,
+            message: `codex ended before turn/completed (${exit})${detail ? `: ${detail}` : " — no crash detail; it may have been interrupted externally"}`,
           });
           settle(false, "exit_before_result");
         }

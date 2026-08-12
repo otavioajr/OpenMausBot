@@ -18,10 +18,11 @@ interface Props {
   botId: string;
   botName: string;
   running: boolean;
+  paused: boolean;
   onWake?: () => void;
 }
 
-export function DesktopView({ botId, botName, running, onWake }: Props) {
+export function DesktopView({ botId, botName, running, paused, onWake }: Props) {
   const inlineHost = useRef<HTMLDivElement | null>(null);
   const modalHost = useRef<HTMLDivElement | null>(null);
   const rfb = useRef<RFB | null>(null);
@@ -32,7 +33,9 @@ export function DesktopView({ botId, botName, running, onWake }: Props) {
   const allowReconnect = useRef(false);
   const [expanded, setExpanded] = useState(false);
   const [control, setControl] = useState<Control>("bot");
-  const [status, setStatus] = useState<"idle" | "connecting" | "live" | "stopped" | "error">("idle");
+  const parkedStatus = useRef<"paused" | "stopped">(paused ? "paused" : "stopped");
+  parkedStatus.current = paused ? "paused" : "stopped";
+  const [status, setStatus] = useState<"idle" | "connecting" | "live" | "paused" | "stopped" | "error">("idle");
   const [error, setError] = useState<string | null>(null);
 
   const connect = useCallback(async () => {
@@ -44,7 +47,7 @@ export function DesktopView({ botId, botName, running, onWake }: Props) {
       const res = await fetch(`/api/bots/${botId}/desktop/ticket?wake=${reconnecting ? "0" : "1"}`);
       const data = await res.json();
       if (res.status === 409 && data.stopped) {
-        setStatus("stopped");
+        setStatus(data.state === "paused" ? "paused" : "stopped");
         setError(null);
         // Poll without wake permission. The next Codex turn starts the same
         // container; the monitor then reconnects without needing a page reload.
@@ -82,7 +85,7 @@ export function DesktopView({ botId, botName, running, onWake }: Props) {
         holder.remove();
         const clean = (event as CustomEvent<{ clean?: boolean }>).detail?.clean;
         if (!allowReconnect.current) {
-          setStatus(clean ? "idle" : "error");
+          setStatus(parkedStatus.current);
           if (!clean) setError("the desktop stream dropped");
           return;
         }
@@ -109,13 +112,19 @@ export function DesktopView({ botId, botName, running, onWake }: Props) {
         setError(message);
       }
     }
-  }, [botId, expanded, onWake, running]);
+  }, [botId, expanded, running]);
 
   connectRef.current = connect;
 
   useEffect(() => {
     allowReconnect.current = running;
-    if (running) void connectRef.current();
+    if (running) {
+      void connectRef.current();
+    } else {
+      setExpanded(false);
+      setError(null);
+      setStatus(paused ? "paused" : "stopped");
+    }
     return () => {
       allowReconnect.current = false;
       if (reconnectTimer.current !== null) window.clearTimeout(reconnectTimer.current);
@@ -126,7 +135,7 @@ export function DesktopView({ botId, botName, running, onWake }: Props) {
       canvasHolder.current = null;
     };
     // Reconnect only when the bot or its running state changes.
-  }, [botId, running]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [botId, running, paused]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Re-parent the live canvas when expanding/collapsing.
   useEffect(() => {
@@ -189,6 +198,8 @@ export function DesktopView({ botId, botName, running, onWake }: Props) {
           ? (error ?? "Desktop unavailable")
           : status === "stopped"
             ? "Stopped — waiting for the next turn"
+          : status === "paused"
+            ? "Paused — desktop state preserved"
           : running
             ? "Live desktop disconnected — reconnecting…"
             : "Stopped — wakes on the next turn";
@@ -218,7 +229,7 @@ export function DesktopView({ botId, botName, running, onWake }: Props) {
                 onClick={onWake}
                 className="rounded-md bg-raised px-2 py-1 text-[12px] text-ink hover:bg-raised-hover"
               >
-                Start
+                {paused ? "Resume" : "Start"}
               </button>
             )}
           </div>

@@ -11,9 +11,13 @@ OpenMausBot can use the host VPS as a free alternative to `box.ascii.dev`.
 | Off | No computer environment is selected |
 
 An isolated environment is created when Cloud is selected (or lazily on the
-first turn), then parked. Every turn wakes it; completion parks it again. Stop
-preserves `/workspace` and Codex sessions. Deleting the bot removes the agent,
-credential proxy, writable layer, and both networks before deleting bot state.
+first turn), then parked. Every turn wakes it; completion parks it again.
+Graphical environments use Docker pause/unpause, preserving the live X11
+session, Chrome tabs/login, windows, cursor, `/workspace`, and Codex sessions.
+Paused desktops consume no CPU but retain their resident RAM. Terminal-only
+environments use stop/start to release RAM while preserving files and Codex
+sessions. Deleting the bot removes the agent, credential proxy, writable layer,
+and both networks before deleting bot state.
 
 ## Resource limits
 
