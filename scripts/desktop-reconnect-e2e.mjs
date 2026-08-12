@@ -31,7 +31,17 @@ const connect = async (label, reconnecting = false) => {
 };
 
 const first = await connect("FIRST");
-console.log("KILL_BRIDGE_NOW");
+// Drop the bridge from the host, the way a lost `docker exec` would: the
+// container, X11 and Chrome stay healthy, only the disposable pipe dies.
+const { execFileSync } = await import("node:child_process");
+const container = `omb-bot-${botId}`;
+const pids = execFileSync("docker", ["top", container, "-eo", "pid,args"], { encoding: "utf8" })
+  .split("\n")
+  .filter((line) => line.includes("socat - TCP:127.0.0.1:5901"))
+  .map((line) => line.trim().split(/\s+/)[0]);
+if (pids.length === 0) throw new Error("no live bridge to drop");
+execFileSync("kill", ["-9", ...pids]);
+console.log(`BRIDGE_DROPPED pids=${pids.join(",")}`);
 await new Promise((resolve, reject) => {
   const timer = setTimeout(() => reject(new Error("first bridge did not close")), 20_000);
   first.once("close", () => {
