@@ -41,7 +41,7 @@ export function DesktopView({ botId, botName, running, onWake }: Props) {
     setError(null);
     try {
       const reconnecting = reconnectAttempt.current > 0;
-      const res = await fetch(`/api/bots/${botId}/desktop/ticket${reconnecting ? "?wake=0" : ""}`);
+      const res = await fetch(`/api/bots/${botId}/desktop/ticket?wake=${reconnecting ? "0" : "1"}`);
       const data = await res.json();
       if (res.status === 409 && data.stopped) {
         setStatus("stopped");

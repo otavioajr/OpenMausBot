@@ -787,7 +787,10 @@ const server = createServer(async (req, res) => {
           // The first monitor connection may wake the environment. A reconnect
           // must not: after an intentional park, a stale browser tab would
           // otherwise wake the bot again forever.
-          const mayWake = url.searchParams.get("wake") !== "0";
+          // Safe by default for stale tabs: only an explicit initial-open
+          // request may wake. Older clients omit this flag and therefore can
+          // never resurrect an intentionally parked environment.
+          const mayWake = url.searchParams.get("wake") === "1";
           const box = mayWake
             ? await dockerbox.provisionContainer(bot.id, bot.name)
             : await dockerbox.findContainer(bot.id);

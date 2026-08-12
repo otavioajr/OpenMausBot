@@ -8,7 +8,7 @@ if (!botId) throw new Error("usage: node desktop-reconnect-e2e.mjs <botId>");
 
 const wsBase = BASE.replace(/^http/, "ws");
 const ticket = async (reconnecting) => {
-  const response = await fetch(`${BASE}/api/bots/${botId}/desktop/ticket${reconnecting ? "?wake=0" : ""}`);
+  const response = await fetch(`${BASE}/api/bots/${botId}/desktop/ticket?wake=${reconnecting ? "0" : "1"}`);
   const body = await response.json();
   if (!response.ok || !body.url) throw new Error(body.error ?? `ticket ${response.status}`);
   return body.url;
