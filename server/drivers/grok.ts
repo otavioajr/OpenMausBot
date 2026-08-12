@@ -18,6 +18,70 @@ import { appendNative } from "./native.ts";
 const DRIVER_KIND = "grok";
 const DEFAULT_URL = "https://api.x.ai/v1";
 
+// Some OpenAI-compatible gateways (routers fronting reasoning models) emit the
+// model's scratchpad inline as <think>…</think> inside the normal content
+// stream. That's not assistant output — strip it from both the live stream and
+// the settled text, or every reply starts with a stray "<think></think>".
+const THINK_OPEN = "<think>";
+const THINK_CLOSE = "</think>";
+
+/** Length of the longest suffix of `s` that is a proper prefix of `tag`. */
+function danglingTagLen(s: string, tag: string): number {
+  for (let n = Math.min(s.length, tag.length - 1); n > 0; n--) {
+    if (s.endsWith(tag.slice(0, n))) return n;
+  }
+  return 0;
+}
+
+/** Stateful stripper — tags may straddle chunk boundaries, so partial tags are
+ * held back rather than leaked downstream. */
+function makeThinkStripper() {
+  let buf = "";
+  let inside = false;
+  return {
+    push(chunk: string): string {
+      buf += chunk;
+      let out = "";
+      for (;;) {
+        if (inside) {
+          const end = buf.indexOf(THINK_CLOSE);
+          if (end === -1) {
+            buf = buf.slice(buf.length - danglingTagLen(buf, THINK_CLOSE));
+            return out;
+          }
+          buf = buf.slice(end + THINK_CLOSE.length);
+          inside = false;
+          continue;
+        }
+        const start = buf.indexOf(THINK_OPEN);
+        if (start === -1) {
+          const hold = danglingTagLen(buf, THINK_OPEN);
+          out += buf.slice(0, buf.length - hold);
+          buf = buf.slice(buf.length - hold);
+          return out;
+        }
+        out += buf.slice(0, start);
+        buf = buf.slice(start + THINK_OPEN.length);
+        inside = true;
+      }
+    },
+    /** Emit whatever is left once the stream ends (an unclosed block is dropped). */
+    flush(): string {
+      const rest = inside ? "" : buf;
+      buf = "";
+      return rest;
+    },
+  };
+}
+
+function stripThink(text: string): string {
+  const s = makeThinkStripper();
+  return (s.push(text) + s.flush()).trim();
+}
+
+/** Internals exposed for unit tests only. */
+export const __testing = { makeThinkStripper, stripThink };
+
 const MODELS = {
   default: "grok-4",
   options: [
@@ -107,7 +171,7 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
       if (!opts.stream) {
         const json: any = await res.json();
         return {
-          text: json.choices?.[0]?.message?.content ?? "",
+          text: stripThink(json.choices?.[0]?.message?.content ?? ""),
           usage: json.usage
             ? { input: json.usage.prompt_tokens ?? 0, output: json.usage.completion_tokens ?? 0 }
             : null,
@@ -115,6 +179,7 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
       }
       let text = "";
       let usage: { input: number; output: number } | null = null;
+      const stripper = makeThinkStripper();
       const reader = res.body!.getReader();
       const decoder = new TextDecoder();
       let buf = "";
@@ -137,15 +202,24 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
           }
           const delta = chunk.choices?.[0]?.delta?.content;
           if (delta) {
-            text += delta;
-            opts.onDelta?.(delta);
+            const visible = stripper.push(delta);
+            if (visible) {
+              text += visible;
+              opts.onDelta?.(visible);
+            }
           }
           if (chunk.usage) {
             usage = { input: chunk.usage.prompt_tokens ?? 0, output: chunk.usage.completion_tokens ?? 0 };
           }
         }
       }
-      return { text, usage };
+      // release any text the stripper was holding back as a possible partial tag
+      const tail = stripper.flush();
+      if (tail) {
+        text += tail;
+        opts.onDelta?.(tail);
+      }
+      return { text: text.trim(), usage };
     };
 
     const sendTurn = async (turn: SendTurnInput) => {
