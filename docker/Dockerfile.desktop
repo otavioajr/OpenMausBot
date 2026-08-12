@@ -1,0 +1,78 @@
+# Graphical variant of the bot computer image: everything from the terminal
+# image plus an isolated X desktop the bot can drive and the human can take
+# over. One shared image for every bot; per-bot state lives in the container's
+# capped writable layer.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    HOME=/home/ubuntu \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/ubuntu/.local/bin
+
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+      ca-certificates curl wget git jq unzip zip passwd \
+      python3 python3-pip python3-venv \
+      ripgrep tree less nano vim-tiny \
+      procps iputils-ping dnsutils \
+      build-essential \
+      # X stack, window manager, VNC and the tools the broker drives
+      xvfb x11vnc fluxbox xterm xdotool scrot xauth x11-utils x11-xserver-utils \
+      socat util-linux iproute2 \
+      fonts-dejavu-core fonts-liberation \
+      # a light browser so GUI work has something real to do
+      epiphany-browser \
+      # light file manager, handy when a human takes over
+      pcmanfm \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm config set update-notifier false \
+    && npm install -g @openai/codex@0.130.0
+
+# Two users on purpose:
+#   ubuntu  (uid 1000) — the agent. Runs Codex, shell, files.
+#   desktop            — owns the X server, window manager and VNC.
+# The agent cannot read the desktop user's X cookie, so its ONLY way to touch
+# the GUI is the broker socket, where the human-control lock is enforced.
+# /workspace is group-shared (setgid `botio`) so the desktop user can drop
+# screenshots where the agent reads them.
+RUN groupadd -r botio \
+    && useradd -m -s /bin/bash -G botio desktop \
+    && usermod -aG botio ubuntu \
+    && mkdir -p /workspace /home/ubuntu/.codex /opt/omb /var/log/omb /run/omb /tmp/.X11-unix \
+    && chown -R ubuntu:ubuntu /home/ubuntu \
+    && chown -R ubuntu:botio /workspace \
+    && chmod 2775 /workspace \
+    && chown -R desktop:desktop /var/log/omb \
+    && chown desktop:botio /run/omb \
+    && chmod 0750 /run/omb \
+    && chmod 1777 /tmp/.X11-unix \
+    && install -o desktop -g desktop -m 600 /dev/null /home/desktop/.Xauthority
+
+COPY --chown=ubuntu:ubuntu codex-config.toml /home/ubuntu/.codex/config.toml
+COPY desktop/broker.py /opt/omb/broker.py
+COPY desktop/start-desktop.sh /opt/omb/start-desktop.sh
+COPY desktop/botpc /usr/local/bin/botpc
+COPY --chown=desktop:desktop desktop/fluxbox-menu /home/desktop/.fluxbox/menu
+# Fluxbox shells out to fbsetbg for the wallpaper and pops a blocking
+# xmessage when no setter is found. Two guards: provide the Esetroot setter it
+# looks for first, and neuter xmessage so a stray dialog can never sit on the
+# bot's screen (the background itself is painted with xsetroot at startup).
+RUN printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/Esetroot \
+    && printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/xmessage \
+    && chmod 0755 /usr/local/bin/Esetroot /usr/local/bin/xmessage
+RUN chmod 0755 /opt/omb/start-desktop.sh /usr/local/bin/botpc \
+    && chmod 0644 /opt/omb/broker.py
+
+# The desktop user's shell must not start inside /workspace: that directory is
+# owned by the agent (0700-ish) and login shells there emit permission errors.
+WORKDIR /home/desktop
+
+# PID 1 is the desktop user, never root: under --cap-drop ALL a root PID 1
+# could not drop privileges (no CAP_SETUID) nor write its own runtime dir
+# (no CAP_DAC_OVERRIDE). The agent is entered separately with
+# `docker exec -u ubuntu`, so the two users stay isolated.
+USER desktop
+CMD ["/opt/omb/start-desktop.sh"]

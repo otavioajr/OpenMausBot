@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""botpc — the agent's remote control for its own desktop.
+
+Every call goes through the input broker, which enforces the control lock:
+while the human holds control, input operations fail with a clear message and
+the agent is expected to wait instead of fighting for the cursor.
+
+Usage:
+  botpc screenshot [path]           capture the screen (default /workspace/screen.png)
+  botpc click X Y [button]          click at a coordinate
+  botpc move X Y                    move the pointer
+  botpc type "text"                 type text
+  botpc key ctrl+l                  press a key combo (space separated for many)
+  botpc scroll -3                   scroll (negative = down)
+  botpc open https://example.com    open a URL in the browser
+  botpc exec xterm                  launch a GUI app
+  botpc state                       who currently controls the desktop
+"""
+
+from __future__ import annotations
+
+import json
+import socket
+import sys
+
+SOCKET_PATH = "/run/omb/input.sock"
+
+
+def call(payload: dict) -> dict:
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(60)
+        sock.connect(SOCKET_PATH)
+    except (FileNotFoundError, ConnectionRefusedError, PermissionError):
+        return {
+            "ok": False,
+            "error": "the desktop is not running — ask the user to start it, "
+            "or keep working in the terminal",
+        }
+    with sock, sock.makefile("rwb") as stream:
+        stream.write((json.dumps(payload) + "\n").encode())
+        stream.flush()
+        line = stream.readline()
+    return json.loads(line or "{}")
+
+
+def build(argv: list[str]) -> dict:
+    cmd = argv[0] if argv else "state"
+    rest = argv[1:]
+    if cmd == "screenshot":
+        return {"op": "screenshot", "path": rest[0] if rest else "/workspace/screen.png"}
+    if cmd == "click":
+        req: dict = {"op": "click"}
+        if len(rest) >= 2:
+            req["x"], req["y"] = int(rest[0]), int(rest[1])
+        if len(rest) >= 3:
+            req["button"] = int(rest[2])
+        return req
+    if cmd == "move":
+        return {"op": "move", "x": int(rest[0]), "y": int(rest[1])}
+    if cmd == "type":
+        return {"op": "type", "text": " ".join(rest)}
+    if cmd == "key":
+        return {"op": "key", "keys": " ".join(rest)}
+    if cmd == "scroll":
+        return {"op": "scroll", "amount": int(rest[0]) if rest else -3}
+    if cmd == "open":
+        return {"op": "open", "url": rest[0] if rest else ""}
+    if cmd == "exec":
+        return {"op": "exec", "argv": rest}
+    if cmd == "state":
+        return {"op": "state"}
+    raise SystemExit(f"unknown command: {cmd}\n\n{__doc__}")
+
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    result = call(build(sys.argv[1:]))
+    print(json.dumps(result))
+    return 0 if result.get("ok") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

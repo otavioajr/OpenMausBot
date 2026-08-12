@@ -1,0 +1,8 @@
+[begin] (bot desktop)
+  [exec] (Terminal) {xterm -fa Monospace -fs 11 -bg #101317 -fg #e6e6e6}
+  [exec] (Browser) {epiphany-browser}
+  [exec] (Files) {pcmanfm}
+  [separator]
+  [workspaces] (Workspaces)
+  [restart] (Restart window manager)
+[end]

@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import { useStore, type Bot } from "@/state/store";
 import { ApiKeyRow } from "./ApiKeys";
+import { DesktopView } from "./DesktopView";
 import { cn } from "@/lib/cn";
 
 async function api(path: string, init?: RequestInit): Promise<any> {
@@ -42,9 +43,13 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
   const [boxState, setBoxState] = useState<string | null>(null);
   const [computerKind, setComputerKind] = useState<"box" | "docker">("box");
   const [limits, setLimits] = useState<{ cpus?: string; memory?: string; storage?: string } | null>(null);
+  // Graphical desktop: whether this host can build one, and whether THIS bot's
+  // container already has one (older containers are terminal-only).
+  const [desktopSupported, setDesktopSupported] = useState(false);
+  const [hasDesktop, setHasDesktop] = useState(false);
   const [polledFrame, setPolledFrame] = useState<{ png: string; mime: string } | null>(null);
   const [localFrame, setLocalFrame] = useState<string | null>(null);
-  const [pending, setPending] = useState<"join" | "sleep" | null>(null);
+  const [pending, setPending] = useState<"join" | "sleep" | "provision" | "desktop-upgrade" | null>(null);
   const [error, setError] = useState<string | null>(null);
   // bumped when a Box token is saved inline, to re-run the spin-up flow
   const [retry, setRetry] = useState(0);
@@ -58,6 +63,8 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
     setLocalFrame(null);
     setComputerKind("box");
     setLimits(null);
+    setDesktopSupported(false);
+    setHasDesktop(false);
     setError(null);
     const isElectron = Boolean(window.ogb);
     if (bot.computer === "off") {
@@ -78,6 +85,8 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
           setComputerKind("docker");
           setLimits(status.limits ?? null);
           setBoxState(status.box?.state ?? "stopped");
+          setDesktopSupported(Boolean(status.desktopSupported));
+          setHasDesktop(Boolean(status.box?.hasDesktop));
           setPhase("docker");
           return;
         }
@@ -168,14 +177,24 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
         ? cloudFrame && `data:${cloudFrame.mime};base64,${cloudFrame.png}`
         : null;
 
-  const run = (kind: "join" | "sleep") => {
+  const run = (kind: "join" | "sleep" | "provision" | "desktop-upgrade") => {
     setPending(kind);
     setError(null);
-    api(`/api/bots/${bot.id}/computer/${kind}`, { method: "POST" })
+    // The desktop upgrade lives under /desktop/upgrade; the rest are computer ops.
+    const path =
+      kind === "desktop-upgrade"
+        ? `/api/bots/${bot.id}/desktop/upgrade`
+        : `/api/bots/${bot.id}/computer/${kind}`;
+    api(path, { method: "POST" })
       .then((result) => {
         // the join URL's stream token rotates — always freshly minted, never cached
         if (kind === "join" && result.joinUrl) window.open(result.joinUrl);
         if (kind === "sleep") setBoxState(computerKind === "docker" ? "stopped" : "archived");
+        if (kind === "provision") setBoxState(result.state ?? "running");
+        if (kind === "desktop-upgrade") {
+          setHasDesktop(Boolean(result.hasDesktop));
+          setBoxState(result.state ?? "running");
+        }
       })
       .catch((e) => setError(e.message))
       .finally(() => setPending(null));
@@ -215,8 +234,20 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
         <div className="mb-1.5 mt-2 flex items-center justify-between text-[13px] text-ink-secondary">
           <span>{computerKind === "docker" ? `${bot.name}'s environment` : `${bot.name}'s screen`}</span>
           {phase === "local" && <span className="text-[11px]">this Mac</span>}
-          {phase === "docker" && <span className="text-[11px]">terminal only</span>}
+          {phase === "docker" && (
+            <span className="text-[11px]">{hasDesktop ? "live desktop" : "terminal only"}</span>
+          )}
         </div>
+        {/* A graphical bot streams live in the monitor slot; everything else
+            keeps the static frame/placeholder. */}
+        {phase === "docker" && hasDesktop ? (
+          <DesktopView
+            botId={bot.id}
+            botName={bot.name}
+            running={boxState === "running"}
+            onWake={() => run("provision")}
+          />
+        ) : (
         <div className="flex aspect-[16/10] w-full items-center justify-center overflow-hidden rounded-xl bg-card">
           {frameSrc ? (
             <img src={frameSrc} alt={`${bot.name}'s screen`} className="h-full w-full object-contain" />
@@ -251,6 +282,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
             </div>
           )}
         </div>
+        )}
 
         {error && (
           <div className="mt-2 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-[12px] text-danger">
@@ -298,14 +330,34 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
 
         {phase === "docker" && (
           <div className="mt-3 rounded-xl bg-card p-4 text-[13px] text-ink-secondary">
-            <div className="font-medium text-ink">Terminal-only isolated environment</div>
+            <div className="font-medium text-ink">
+              {hasDesktop ? "Isolated Linux desktop" : "Terminal-only isolated environment"}
+            </div>
             <div className="mt-1">
-              Codex, shell commands and files run inside this bot's container. Files persist while the bot exists; deleting
-              the bot deletes the environment.
+              {hasDesktop
+                ? "The bot works on its own graphical desktop — you can watch live and take over at any time. Files persist while the bot exists; deleting the bot deletes the environment."
+                : "Codex, shell commands and files run inside this bot's container. Files persist while the bot exists; deleting the bot deletes the environment."}
             </div>
             <div className="mt-2 text-[12px]">
               Limits: {limits?.cpus ?? "1"} vCPU · {limits?.memory ?? "2g"} RAM · {limits?.storage ?? "10G"} disk
             </div>
+
+            {!hasDesktop && desktopSupported && (
+              <button
+                onClick={() => {
+                  // Recreating the container drops its writable layer, so this
+                  // must never happen behind the user's back.
+                  if (!confirm("Add a graphical desktop to this bot?\n\nThe container is recreated, so files currently in /workspace are lost.")) return;
+                  void run("desktop-upgrade");
+                }}
+                disabled={pending === "desktop-upgrade"}
+                className="mt-3 flex items-center gap-2 rounded-lg bg-raised px-3 py-2 text-[13px] text-ink hover:bg-raised-hover disabled:opacity-50"
+              >
+                {pending === "desktop-upgrade" ? <Loader2 size={14} className="animate-spin" /> : <Monitor size={14} />}
+                Add graphical desktop
+              </button>
+            )}
+
             {boxState === "running" && (
               <button
                 onClick={() => run("sleep")}

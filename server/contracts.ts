@@ -103,6 +103,9 @@ export interface SendTurnInput {
     /** Self-hosted isolated environment: the provider CLI itself runs inside
      * this per-bot Docker container, so its shell/files are truly isolated. */
     dockerComputer?: { containerName: string };
+    /** The isolated container also runs a graphical desktop the agent can
+     * drive (via `botpc`) and the user can watch and take over. */
+    dockerDesktop?: boolean;
     /** Local computer use via the Electron-hosted cua-driver daemon —
      * spawn config comes verbatim from cua-connection.json (the daemon
      * MUST be spawned by Electron main; the harness only points the agent

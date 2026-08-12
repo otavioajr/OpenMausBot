@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 
 import * as box from "./box.ts";
 import * as composio from "./composio.ts";
+import * as desktop from "./desktop.ts";
 import * as dockerbox from "./dockerbox.ts";
 import { ensureDirs, instanceConfigs, loadConfig, saveConfig, EVENTS_DIR, NATIVE_DIR } from "./config.ts";
 import type { RuntimeEvent } from "./contracts.ts";
@@ -394,12 +395,16 @@ async function startTurn(botId: string, text: string, opts?: { commsDepth?: numb
       if (cfg.composio?.key) integrations.composio = { key: cfg.composio.key, url: cfg.composio.url };
       const wants = bot.computer; // 'cloud' | 'local' | 'off' | undefined(auto)
       if (wants === "cloud" && DOCKER_COMPUTERS) {
+        // `instance` is already the resolved runtime (Codex inside the
+        // container), so this checks the runtime — not the model the user
+        // picked. Any 9router model can run isolated.
         if (instance.driverKind !== "codex") {
-          throw new Error('Self-hosted cloud environments currently require the "Codex" provider — switch this bot\'s model to Codex or choose Local');
+          throw new Error("Isolated environments need the Codex runtime — it is unavailable right now");
         }
         broadcast({ kind: "computer", botId: bot.id, state: "provisioning" });
         const container = await dockerbox.provisionContainer(bot.id, bot.name);
         integrations.dockerComputer = { containerName: container.name };
+        integrations.dockerDesktop = container.hasDesktop;
         broadcast({ kind: "computer", botId: bot.id, state: "running" });
       } else if (wants !== "off" && wants !== "local" && !DOCKER_COMPUTERS && box.boxConfigured(cfg)) {
         let b = await box.findBox(cfg, bot.id).catch(() => null);
@@ -451,7 +456,10 @@ async function startTurn(botId: string, text: string, opts?: { commsDepth?: numb
         system:
           persona +
           (integrations.dockerComputer
-            ? " You are running inside your own isolated Linux container. /workspace and your Codex sessions persist between turns; the environment is deleted when this bot is deleted. Use shell and file tools normally — they already operate inside your container."
+            ? " You are running inside your own isolated Linux container. /workspace and your Codex sessions persist between turns; the environment is deleted when this bot is deleted. Use shell and file tools normally — they already operate inside your container." +
+              (integrations.dockerDesktop
+                ? " This container also has a real graphical desktop (X11 + window manager + browser) that the user watches live. Drive it with the `botpc` command from the shell: `botpc screenshot /workspace/shot.png` to see the screen, then `botpc click X Y`, `botpc move X Y`, `botpc type \"text\"`, `botpc key ctrl+l`, `botpc scroll -3`, `botpc open <url>`, `botpc exec <app>`. Always take a screenshot before and after acting, and read it before deciding where to click — never guess coordinates. If a command replies that input is locked, the user has taken control of the desktop: stop sending input, explain what you were about to do, and wait for them to hand control back."
+                : "")
             : integrations.computer && instance.driverKind !== "boxAgent"
               ? " You have your own cloud computer — use the computer tools (screenshot, computer_exec, open_url) whenever browsing or acting on a desktop helps."
               : integrations.localComputer
@@ -766,7 +774,52 @@ const server = createServer(async (req, res) => {
     if (m && method === "GET") {
       return json(res, 200, DOCKER_COMPUTERS ? await dockerbox.containerStatus(m[1]) : await box.boxStatus(cfg, m[1]));
     }
-    m = path.match(/^\/api\/bots\/([\w-]+)\/computer\/(provision|join|sleep|exec|screenshot)$/);
+    // ── the bot's desktop (live stream + control lock) ──
+    m = path.match(/^\/api\/bots\/([\w-]+)\/desktop\/(ticket|control|screenshot|upgrade)$/);
+    if (m) {
+      const bot = store.bot(m[1]);
+      if (!bot) return json(res, 404, { error: "no such bot" });
+      if (!DOCKER_COMPUTERS || !dockerbox.desktopEnabled()) {
+        return json(res, 409, { error: "graphical desktops are not enabled on this host" });
+      }
+      switch (m[2]) {
+        case "ticket": {
+          // Streaming requires a running graphical container; wake it first so
+          // clicking the monitor never lands on a dead socket.
+          const box = await dockerbox.provisionContainer(bot.id, bot.name);
+          if (!box.hasDesktop) {
+            return json(res, 409, {
+              error: "this bot's environment is terminal-only",
+              upgradable: true,
+            });
+          }
+          return json(res, 200, { ...desktop.issueDesktopTicket(bot.id), control: desktop.controlState(bot.id) });
+        }
+        case "control": {
+          if (method !== "POST") return json(res, 405, { error: "POST required" });
+          const body = await readBody(req);
+          const wanted = String(body.control ?? "");
+          const result =
+            wanted === "human" ? await desktop.takeControl(bot.id) : await desktop.releaseControl(bot.id);
+          broadcast({ kind: "computer", botId: bot.id, state: "running", control: result.control });
+          return json(res, 200, result);
+        }
+        case "screenshot": {
+          const dataUrl = await desktop.captureScreenshot(bot.id);
+          if (!dataUrl) return json(res, 503, { error: "the desktop is not running" });
+          return json(res, 200, { image: dataUrl });
+        }
+        case "upgrade": {
+          if (method !== "POST") return json(res, 405, { error: "POST required" });
+          // Destructive: recreating the container drops its writable layer.
+          const box = await dockerbox.upgradeToDesktop(bot.id, bot.name);
+          broadcast({ kind: "computer", botId: bot.id, state: box.state });
+          return json(res, 200, { ok: true, state: box.state, hasDesktop: box.hasDesktop });
+        }
+      }
+    }
+
+    m = path.match(/^\/api\/bots\/([\w-]+)\/computer\/(provision|sleep|join|screenshot|exec)$/);
     if (m && method === "POST") {
       const botId = m[1];
       const bot = store.bot(botId);
@@ -779,7 +832,10 @@ const server = createServer(async (req, res) => {
               boxId: env.name,
               machineName: env.name,
               state: env.state,
-              desktopAvailable: false,
+              // Report the container's real capability; hardcoding false made
+              // the panel treat graphical containers as terminal-only.
+              desktopAvailable: env.hasDesktop && env.state === "running",
+              hasDesktop: env.hasDesktop,
               kind: "docker",
             });
           }
@@ -846,6 +902,10 @@ const server = createServer(async (req, res) => {
 // interface that is already access-controlled (VPN/mesh), never 0.0.0.0
 // on a public host.
 const HOST = process.env.OMB_HOST || "127.0.0.1";
+
+// The desktop bridge owns the /api/desktop/stream upgrade; HTTP routes above
+// are untouched. Registered before listen so no client can race the handler.
+if (DOCKER_COMPUTERS) desktop.attachDesktopBridge(server);
 
 server.listen(PORT, HOST, () => {
   console.log(`openmausbot server on http://${HOST}:${PORT}`);

@@ -23,7 +23,23 @@ const execFileAsync = promisify(execFile);
 
 export const IMAGE = process.env.OMB_DOCKER_IMAGE || "openmausbot-box:latest";
 export const PROXY_IMAGE = process.env.OMB_DOCKER_PROXY_IMAGE || "openmausbot-router-proxy:latest";
+export const DESKTOP_IMAGE = process.env.OMB_DOCKER_DESKTOP_IMAGE || "openmausbot-desktop:latest";
 const LABEL = "openmausbot.bot-id";
+
+/** Graphical desktops are opt-in: without the image built, isolated bots stay
+ * terminal-only and every desktop route degrades to "unavailable". */
+export function desktopEnabled(): boolean {
+  return (process.env.OMB_DOCKER_DESKTOP ?? "true") !== "false";
+}
+
+/** A desktop needs more headroom than a terminal (X + WM + browser). Kept as
+ * a separate ceiling so terminal bots stay cheap. */
+const DESKTOP_LIMITS = {
+  cpus: process.env.OMB_DOCKER_DESKTOP_CPUS || "1.5",
+  memory: process.env.OMB_DOCKER_DESKTOP_MEMORY || "3g",
+  pids: process.env.OMB_DOCKER_DESKTOP_PIDS || "1024",
+  shm: process.env.OMB_DOCKER_DESKTOP_SHM || "512m",
+};
 
 /** Per-bot resource ceiling. Containers are idle most of the time; these caps
  * exist so one runaway bot cannot take the host down with it. */
@@ -40,6 +56,10 @@ export interface DockerBox {
   name: string;
   state: BoxState;
   containerId: string | null;
+  /** True when this container was created from the graphical image. Existing
+   * terminal containers keep working; upgrading is an explicit user action
+   * because it recreates the container and wipes its filesystem. */
+  hasDesktop: boolean;
 }
 
 /** Container/volume name for a bot. Docker names allow [a-zA-Z0-9_.-], and bot
@@ -90,14 +110,18 @@ export async function dockerConfigured(): Promise<boolean> {
 async function inspectContainer(name: string): Promise<DockerBox | null> {
   // Inspect by exact name. `docker ps --filter name=…` is a regex/substring
   // filter and can select the wrong bot when ids share a prefix.
-  const res = await docker(["container", "inspect", name, "--format", "{{.Id}}|{{.State.Status}}"]).catch(() => null);
+  const res = await docker([
+    "container", "inspect", name,
+    "--format", `{{.Id}}|{{.State.Status}}|{{index .Config.Labels "openmausbot.desktop"}}`,
+  ]).catch(() => null);
   const line = res?.ok ? res.stdout.trim() : "";
   if (!line) return null;
-  const [containerId, state] = line.split("|");
+  const [containerId, state, desktop] = line.split("|");
   return {
     name,
     containerId: containerId ?? null,
     state: state === "running" ? "running" : "stopped",
+    hasDesktop: desktop === "true",
   };
 }
 
@@ -190,8 +214,10 @@ export async function provisionContainer(
   botId: string,
   botName: string,
   routerKey = process.env.NINEROUTER_API_KEY ?? "",
+  opts: { desktop?: boolean } = {},
 ): Promise<DockerBox> {
   if (!routerKey) throw new Error("NINEROUTER_API_KEY is required for isolated bot environments");
+  const wantDesktop = opts.desktop ?? desktopEnabled();
   const name = containerNameFor(botId);
   const networks = await ensureNetwork(botId);
   await ensureProxy(botId, routerKey, networks);
@@ -199,12 +225,31 @@ export async function provisionContainer(
 
   if (existing) {
     if (existing.state !== "running") {
-      const started = await docker(["start", name], 30_000);
+      const started = await docker(["start", name], 60_000);
       if (!started.ok) throw new Error(`could not wake the container: ${started.stderr.slice(0, 200)}`);
     }
     await waitForProxy(name);
+    // An existing terminal container is never silently recreated: that would
+    // delete the bot's files. The panel offers an explicit upgrade instead.
+    if (existing.hasDesktop) await waitForDesktop(name);
     return { ...existing, state: "running" };
   }
+
+  const desktopArgs = wantDesktop
+    ? [
+        "--label", "openmausbot.desktop=true",
+        "--cpus", DESKTOP_LIMITS.cpus,
+        "--memory", DESKTOP_LIMITS.memory,
+        "--pids-limit", DESKTOP_LIMITS.pids,
+        // X and browsers need real shared memory; the 64m default breaks them.
+        "--shm-size", DESKTOP_LIMITS.shm,
+      ]
+    : [
+        "--label", "openmausbot.desktop=false",
+        "--cpus", LIMITS.cpus,
+        "--memory", LIMITS.memory,
+        "--pids-limit", LIMITS.pids,
+      ];
 
   const created = await docker([
     "run", "-d",
@@ -213,10 +258,7 @@ export async function provisionContainer(
     "--label", "openmausbot.role=agent",
     "--label", `openmausbot.bot-name=${botName.slice(0, 60)}`,
     "--restart", "no",
-    // resource ceiling
-    "--cpus", LIMITS.cpus,
-    "--memory", LIMITS.memory,
-    "--pids-limit", LIMITS.pids,
+    ...desktopArgs,
     "--storage-opt", `size=${LIMITS.storage}`,
     // hardening: no host docker access, no extra capabilities
     "--cap-drop", "ALL",
@@ -225,8 +267,8 @@ export async function provisionContainer(
     // /workspace lives in this capped writable layer: it survives stop/start
     // and is deleted atomically with `docker rm`.
     "-w", "/workspace",
-    IMAGE,
-  ], 120_000);
+    wantDesktop ? DESKTOP_IMAGE : IMAGE,
+  ], 180_000);
 
   if (!created.ok) {
     await docker(["rm", "-f", proxyNameFor(botId)], 30_000);
@@ -236,7 +278,41 @@ export async function provisionContainer(
     throw new Error(`container create failed: ${created.stderr.slice(0, 300)}`);
   }
   await waitForProxy(name);
-  return { name, containerId: created.stdout.trim() || null, state: "running" };
+  if (wantDesktop) await waitForDesktop(name);
+  return { name, containerId: created.stdout.trim() || null, state: "running", hasDesktop: wantDesktop };
+}
+
+/** Block until X, the window manager and the input broker are actually up.
+ * Streaming before this point shows the user a dead grey rectangle.
+ * NOTE: `docker exec` does not inherit the container's runtime env, so DISPLAY
+ * and XAUTHORITY must be passed explicitly or every probe fails. */
+async function waitForDesktop(agentName: string): Promise<void> {
+  for (let attempt = 0; attempt < 80; attempt++) {
+    const ready = await docker([
+      "exec", "-u", "desktop",
+      "-e", "DISPLAY=:1",
+      "-e", "XAUTHORITY=/home/desktop/.Xauthority",
+      agentName,
+      "sh", "-c", "test -S /run/omb/input.sock && xdpyinfo >/dev/null 2>&1",
+    ], 5_000);
+    if (ready.ok) return;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  // Surface the real reason instead of a bare timeout: the desktop log says
+  // exactly what failed (X lock, missing binary, OOM…).
+  const log = await docker(["logs", "--tail", "12", agentName], 5_000);
+  const reason = (log.stdout + log.stderr).trim().split("\n").filter(Boolean).slice(-3).join(" | ");
+  throw new Error(`the desktop did not finish starting${reason ? ` — ${reason}` : ""}`);
+}
+
+/** Recreate a bot's container using the graphical image. Destructive by
+ * nature: the writable layer cannot be carried across images, so the caller
+ * must confirm with the user first. */
+export async function upgradeToDesktop(botId: string, botName: string): Promise<DockerBox> {
+  const existing = await findContainer(botId);
+  if (existing?.hasDesktop) return provisionContainer(botId, botName, undefined, { desktop: true });
+  if (existing) await docker(["rm", "-f", containerNameFor(botId)], 60_000);
+  return provisionContainer(botId, botName, undefined, { desktop: true });
 }
 
 /** Ensure the environment exists and is running, then return the agent. */
@@ -305,11 +381,25 @@ export async function containerStatus(botId: string) {
     return { configured: false, box: null };
   }
   const box = await findContainer(botId);
+  const desktopImage = desktopEnabled()
+    ? (await docker(["image", "inspect", DESKTOP_IMAGE, "--format", "{{.Id}}"], 10_000)).ok
+    : false;
   return {
     configured: true,
     kind: "docker",
-    limits: { cpus: LIMITS.cpus, memory: LIMITS.memory, storage: LIMITS.storage },
-    box: box ? { boxId: box.name, state: box.state, desktopAvailable: false } : null,
+    desktopSupported: desktopImage,
+    limits: desktopImage
+      ? { cpus: DESKTOP_LIMITS.cpus, memory: DESKTOP_LIMITS.memory, storage: LIMITS.storage }
+      : { cpus: LIMITS.cpus, memory: LIMITS.memory, storage: LIMITS.storage },
+    box: box
+      ? {
+          boxId: box.name,
+          state: box.state,
+          // Only a running graphical container can actually be streamed.
+          desktopAvailable: box.hasDesktop && box.state === "running",
+          hasDesktop: box.hasDesktop,
+        }
+      : null,
   };
 }
 
