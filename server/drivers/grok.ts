@@ -31,13 +31,36 @@ export interface GrokConfig {
   url: string;
   /** resolved at create-time from instance environment / app config */
   apiKeyEnv: string;
+  /** Optional model catalog override. The wire format is plain
+   * OpenAI-compatible chat-completions, so this driver also fronts any
+   * compatible gateway (OpenRouter, LiteLLM, a private router, …) — those
+   * serve different model ids than xAI's. Omit to keep the xAI catalog. */
+  models?: { default: string; options: Array<{ id: string; label: string }> };
+}
+
+function decodeModels(raw: unknown): GrokConfig["models"] {
+  const o = (raw ?? {}) as Record<string, unknown>;
+  const options = Array.isArray(o.options)
+    ? o.options
+        .map((m) => {
+          const e = (m ?? {}) as Record<string, unknown>;
+          const id = typeof e.id === "string" ? e.id : "";
+          return id ? { id, label: typeof e.label === "string" ? e.label : id } : null;
+        })
+        .filter((m): m is { id: string; label: string } => m !== null)
+    : [];
+  if (!options.length) return undefined;
+  const fallback = options[0]!.id;
+  return { default: typeof o.default === "string" ? o.default : fallback, options };
 }
 
 function decodeConfig(raw: unknown): GrokConfig {
   const o = (raw ?? {}) as Record<string, unknown>;
+  const models = decodeModels(o.models);
   return {
     url: typeof o.url === "string" ? o.url : DEFAULT_URL,
     apiKeyEnv: typeof o.apiKeyEnv === "string" ? o.apiKeyEnv : "XAI_API_KEY",
+    ...(models ? { models } : {}),
   };
 }
 
@@ -184,10 +207,13 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
 
     const snapshot = async (): Promise<ProviderSnapshot> => {
       if (!apiKey) {
-        return {
-          state: "unavailable",
-          reason: `no xAI API key — add {"xai":{"key":"xai-…"}} to ~/.openmausbot/config.json or set ${config.apiKeyEnv}`,
-        };
+        // A custom `url` means this instance fronts some other OpenAI-compatible
+        // gateway, so don't send people to the xAI dashboard for a key.
+        const reason =
+          config.url === DEFAULT_URL
+            ? `no xAI API key — add {"xai":{"key":"xai-…"}} to ~/.openmausbot/config.json or set ${config.apiKeyEnv}`
+            : `no API key for ${config.url} — set ${config.apiKeyEnv} in this instance's environment (~/.openmausbot/config.json)`;
+        return { state: "unavailable", reason };
       }
       return { state: "available", authenticated: true, version: null };
     };
@@ -197,7 +223,7 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
       driverKind: DRIVER_KIND,
       displayName: input.displayName,
       enabled: input.enabled,
-      models: MODELS,
+      models: config.models ?? MODELS,
       snapshot,
       adapter: {
         provider: DRIVER_KIND,

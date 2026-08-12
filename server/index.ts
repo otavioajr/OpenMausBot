@@ -709,8 +709,16 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`openmausbot server on http://127.0.0.1:${PORT}`);
+// Bind host. Defaults to loopback — the upstream behaviour, safe for the
+// all-in-one desktop app. Set OMB_HOST to serve remote clients (e.g. a
+// Tailscale mesh IP so Macs/phones can reach a server-hosted fleet).
+// NOTE: the API has no authentication of its own; only bind to an
+// interface that is already access-controlled (VPN/mesh), never 0.0.0.0
+// on a public host.
+const HOST = process.env.OMB_HOST || "127.0.0.1";
+
+server.listen(PORT, HOST, () => {
+  console.log(`openmausbot server on http://${HOST}:${PORT}`);
 });
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
