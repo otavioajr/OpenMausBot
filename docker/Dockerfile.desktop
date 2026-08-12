@@ -70,6 +70,7 @@ COPY desktop/broker.py /opt/omb/broker.py
 COPY desktop/start-desktop.sh /opt/omb/start-desktop.sh
 COPY desktop/botpc /usr/local/bin/botpc
 COPY desktop/chrome-wrapper.sh /usr/local/bin/omb-chrome
+COPY desktop/chrome-policy.json /etc/opt/chrome/policies/managed/openmausbot.json
 COPY desktop/make-wallpaper.py /opt/omb/make-wallpaper.py
 
 # Look and feel. All of it is static config owned by the desktop user: window

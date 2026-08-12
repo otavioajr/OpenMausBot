@@ -26,7 +26,6 @@ exec /usr/bin/google-chrome-stable \
   --no-default-browser-check \
   --password-store=basic \
   --proxy-server=socks5://router:1080 \
-  --host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE router" \
   --disable-gpu \
   --disable-breakpad \
   --disable-crash-reporter \

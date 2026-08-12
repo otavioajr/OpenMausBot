@@ -1,0 +1,8 @@
+{
+  "CommandLineFlagSecurityWarningsEnabled": false,
+  "DefaultBrowserSettingEnabled": false,
+  "MetricsReportingEnabled": false,
+  "PasswordManagerEnabled": false,
+  "PromotionalTabsEnabled": false,
+  "TranslateEnabled": false
+}
