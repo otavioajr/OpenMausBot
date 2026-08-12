@@ -32,7 +32,7 @@ export function DesktopView({ botId, botName, running, onWake }: Props) {
   const allowReconnect = useRef(false);
   const [expanded, setExpanded] = useState(false);
   const [control, setControl] = useState<Control>("bot");
-  const [status, setStatus] = useState<"idle" | "connecting" | "live" | "error">("idle");
+  const [status, setStatus] = useState<"idle" | "connecting" | "live" | "stopped" | "error">("idle");
   const [error, setError] = useState<string | null>(null);
 
   const connect = useCallback(async () => {
@@ -40,8 +40,18 @@ export function DesktopView({ botId, botName, running, onWake }: Props) {
     setStatus("connecting");
     setError(null);
     try {
-      const res = await fetch(`/api/bots/${botId}/desktop/ticket`);
+      const reconnecting = reconnectAttempt.current > 0;
+      const res = await fetch(`/api/bots/${botId}/desktop/ticket${reconnecting ? "?wake=0" : ""}`);
       const data = await res.json();
+      if (res.status === 409 && data.stopped) {
+        setStatus("stopped");
+        setError(null);
+        // Poll without wake permission. The next Codex turn starts the same
+        // container; the monitor then reconnects without needing a page reload.
+        reconnectAttempt.current = Math.max(1, reconnectAttempt.current);
+        reconnectTimer.current = window.setTimeout(() => void connectRef.current(), 10_000);
+        return;
+      }
       if (!res.ok) throw new Error(data.error || "could not open the desktop");
       setControl(data.control === "human" ? "human" : "bot");
 
@@ -99,7 +109,7 @@ export function DesktopView({ botId, botName, running, onWake }: Props) {
         setError(message);
       }
     }
-  }, [botId, expanded, running]);
+  }, [botId, expanded, onWake, running]);
 
   connectRef.current = connect;
 
@@ -177,6 +187,8 @@ export function DesktopView({ botId, botName, running, onWake }: Props) {
           : "Starting the live desktop…"
         : status === "error"
           ? (error ?? "Desktop unavailable")
+          : status === "stopped"
+            ? "Stopped — waiting for the next turn"
           : running
             ? "Live desktop disconnected — reconnecting…"
             : "Stopped — wakes on the next turn";

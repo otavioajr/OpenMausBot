@@ -7,15 +7,15 @@ const botId = process.argv[2];
 if (!botId) throw new Error("usage: node desktop-reconnect-e2e.mjs <botId>");
 
 const wsBase = BASE.replace(/^http/, "ws");
-const ticket = async () => {
-  const response = await fetch(`${BASE}/api/bots/${botId}/desktop/ticket`);
+const ticket = async (reconnecting) => {
+  const response = await fetch(`${BASE}/api/bots/${botId}/desktop/ticket${reconnecting ? "?wake=0" : ""}`);
   const body = await response.json();
   if (!response.ok || !body.url) throw new Error(body.error ?? `ticket ${response.status}`);
   return body.url;
 };
 
-const connect = async (label) => {
-  const url = await ticket();
+const connect = async (label, reconnecting = false) => {
+  const url = await ticket(reconnecting);
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(`${wsBase}${url}`);
     const timer = setTimeout(() => reject(new Error(`${label} timed out`)), 20_000);
@@ -40,6 +40,6 @@ await new Promise((resolve, reject) => {
     resolve();
   });
 });
-const second = await connect("SECOND");
+const second = await connect("SECOND", true);
 second.close();
 console.log("RECONNECT_OK");

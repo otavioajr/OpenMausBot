@@ -784,9 +784,16 @@ const server = createServer(async (req, res) => {
       }
       switch (m[2]) {
         case "ticket": {
-          // Streaming requires a running graphical container; wake it first so
-          // clicking the monitor never lands on a dead socket.
-          const box = await dockerbox.provisionContainer(bot.id, bot.name);
+          // The first monitor connection may wake the environment. A reconnect
+          // must not: after an intentional park, a stale browser tab would
+          // otherwise wake the bot again forever.
+          const mayWake = url.searchParams.get("wake") !== "0";
+          const box = mayWake
+            ? await dockerbox.provisionContainer(bot.id, bot.name)
+            : await dockerbox.findContainer(bot.id);
+          if (!box || box.state !== "running") {
+            return json(res, 409, { error: "the desktop is not running", stopped: true });
+          }
           if (!box.hasDesktop) {
             return json(res, 409, {
               error: "this bot's environment is terminal-only",
