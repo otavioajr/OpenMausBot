@@ -1,6 +1,6 @@
 [begin] (Desktop)
   [exec] (Terminal) {lxterminal}
-  [exec] (Browser) {epiphany-browser}
+  [exec] (Google Chrome) {/usr/local/bin/omb-chrome}
   [exec] (Files) {pcmanfm /workspace}
   [separator]
   [exec] (Screenshot to /workspace) {sh -c 'scrot /workspace/screenshot-%Y%m%d-%H%M%S.png'}

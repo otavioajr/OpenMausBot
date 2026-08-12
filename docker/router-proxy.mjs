@@ -3,6 +3,7 @@
 // no workspace, no Docker socket and no published host port.
 import { createServer } from "node:http";
 import { Readable } from "node:stream";
+import { startSocksProxy } from "./egress-proxy.mjs";
 
 const PORT = Number(process.env.PORT || 8080);
 const UPSTREAM = (process.env.ROUTER_UPSTREAM || "https://rs4v44i.abc-tunnel.us").replace(/\/$/, "");
@@ -57,3 +58,6 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => console.log(`router proxy on :${PORT}`));
+// Public-web egress for Chrome. This is a separate SOCKS protocol listener;
+// unlike the model route above it never sees, adds or forwards the API key.
+startSocksProxy();

@@ -18,15 +18,25 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
       # X stack, window manager, VNC and the tools the broker drives
       xvfb x11vnc fluxbox xterm xdotool scrot xauth x11-utils x11-xserver-utils \
       socat util-linux iproute2 \
-      fonts-dejavu-core fonts-liberation \
-      # cosmetics: panel/dock, compositor, wallpaper setter, themed terminal,
-      # GTK theme and the UI font. ~30 MB total, no desktop-environment daemons.
+      # DejaVu is deliberately used for both UI and terminal: the previous
+      # proportional Inter font rendered with huge cell spacing in lxterminal.
+      fonts-dejavu-core fonts-dejavu-extra fonts-liberation \
+      # cosmetics: panel/dock, compositor, wallpaper setter and themed terminal.
       # (papirus-icon-theme was rejected on purpose: 195 MB for icons alone.)
-      tint2 picom hsetroot lxterminal arc-theme fonts-inter \
-      # a light browser so GUI work has something real to do
-      epiphany-browser \
+      tint2 picom hsetroot lxterminal arc-theme \
       # light file manager, handy when a human takes over
       pcmanfm \
+    && rm -rf /var/lib/apt/lists/*
+
+# Official Google Chrome for Linux ARM64. Google began publishing this package
+# in 2026; verify the architecture so a CDN/repository regression cannot put an
+# amd64 binary into our arm64 image. apt resolves Chrome's shared-library deps.
+ARG CHROME_DEB_URL=https://dl.google.com/linux/direct/google-chrome-stable_current_arm64.deb
+RUN curl -fsSL "${CHROME_DEB_URL}" -o /tmp/google-chrome.deb \
+    && test "$(dpkg-deb -f /tmp/google-chrome.deb Architecture)" = arm64 \
+    && apt-get update -qq \
+    && apt-get install -y --no-install-recommends /tmp/google-chrome.deb \
+    && rm -f /tmp/google-chrome.deb \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
@@ -59,6 +69,7 @@ COPY --chown=ubuntu:ubuntu codex-config.toml /home/ubuntu/.codex/config.toml
 COPY desktop/broker.py /opt/omb/broker.py
 COPY desktop/start-desktop.sh /opt/omb/start-desktop.sh
 COPY desktop/botpc /usr/local/bin/botpc
+COPY desktop/chrome-wrapper.sh /usr/local/bin/omb-chrome
 COPY desktop/make-wallpaper.py /opt/omb/make-wallpaper.py
 
 # Look and feel. All of it is static config owned by the desktop user: window
@@ -84,7 +95,7 @@ RUN mkdir -p /usr/share/backgrounds \
 RUN printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/Esetroot \
     && printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/xmessage \
     && chmod 0755 /usr/local/bin/Esetroot /usr/local/bin/xmessage
-RUN chmod 0755 /opt/omb/start-desktop.sh /usr/local/bin/botpc \
+RUN chmod 0755 /opt/omb/start-desktop.sh /usr/local/bin/botpc /usr/local/bin/omb-chrome \
     && chmod 0644 /opt/omb/broker.py
 
 # The desktop user's shell must not start inside /workspace: that directory is

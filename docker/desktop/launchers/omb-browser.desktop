@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
-Name=Browser
-Comment=Web browser
-Exec=epiphany-browser
-Icon=web-browser
+Name=Google Chrome
+Comment=Browse the web with Google Chrome
+Exec=/usr/local/bin/omb-chrome
+Icon=google-chrome
 Terminal=false
 Categories=Network;WebBrowser;

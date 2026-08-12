@@ -129,7 +129,7 @@ def handle(req: dict) -> dict:
             url = str(req.get("url") or "").strip()
             if not url.startswith(("http://", "https://", "file:///")):
                 return {"ok": False, "error": "only http(s)/file urls can be opened"}
-            argv = ["epiphany-browser", url]
+            argv = ["/usr/local/bin/omb-chrome", url]
         else:
             argv = [str(a) for a in (req.get("argv") or [])][:12]
             if not argv:
